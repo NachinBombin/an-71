@@ -97,12 +97,14 @@ function ENT:Initialize()
     self:SetRenderMode(RENDERMODE_TRANSALPHA)
     self:SetColor(Color(255, 255, 255, 0))
 
-    -- Build self.ang directly — never read back via GetAngles() on a VPHYSICS entity
-    -- because the physics object owns the true rotation and GetAngles() may return stale data.
-    -- PhysicsUpdate applies self.ang to both entity and physobj every tick.
-    local angYaw = self.CallDir:Angle().y
-    self.ang = Angle(0, angYaw + 180, 0)
-    self.PrevYaw = self.ang.y  -- seed from self.ang, not GetAngles()
+    -- self.ang.y = visual yaw (model faces correctly at angYaw + 180)
+    -- self.flightYaw = motion yaw (angYaw + 0) — the direction the nose actually travels
+    -- These are kept separate so the model can be visually correct while
+    -- flight direction is derived independently, never from GetForward().
+    local angYaw       = self.CallDir:Angle().y
+    self.ang           = Angle(0, angYaw + 180, 0)  -- visual
+    self.flightYaw     = angYaw                      -- motion: same real-world direction
+    self.PrevYaw       = self.flightYaw
 
     self.AltDriftCurrent  = self.sky
     self.AltDriftTarget   = self.sky
@@ -119,7 +121,6 @@ function ENT:Initialize()
     if IsValid(self.PhysObj) then
         self.PhysObj:Wake()
         self.PhysObj:EnableGravity(false)
-        -- Apply the correct angle to the physobj directly at spawn
         self.PhysObj:SetAngles(self.ang)
     end
 
@@ -130,7 +131,7 @@ function ENT:Initialize()
     end
 
     sound.Play(table.Random(PASS_SOUNDS), self.CenterPos, 75, 100, 0.7)
-    self:Debug("Spawned at " .. tostring(spawnPos) .. " yaw=" .. tostring(self.ang.y))
+    self:Debug("Spawned at " .. tostring(spawnPos) .. " flightYaw=" .. tostring(self.flightYaw) .. " visualYaw=" .. tostring(self.ang.y))
 end
 
 -- ============================================================
@@ -217,7 +218,7 @@ function ENT:Think()
         self.NextPassSound = ct + math.Rand(4, 7)
     end
 
-    -- NPC alert pulse: feed live player positions to every NPC on the map
+    -- NPC alert pulse
     if ct >= self.NextAlertTime then
         local npcs = ents.FindByClass("npc_*")
         local plys = player.GetAll()
@@ -249,19 +250,17 @@ function ENT:Think()
 end
 
 -- ============================================================
--- FLIGHT / ORBIT
+-- FLIGHT / ORBIT  (Foxbat-style kinematic — no GetForward() for motion)
 -- ============================================================
 
 function ENT:PhysicsUpdate(phys)
     if not self.DieTime or not self.sky then return end
-
-    if CurTime() >= self.DieTime then
-        self:Remove()
-        return
-    end
+    if CurTime() >= self.DieTime then self:Remove() return end
 
     local pos = self:GetPos()
+    local dt  = engine.TickInterval()
 
+    -- ── Altitude drift ─────────────────────────────────────
     if CurTime() >= self.AltDriftNextPick then
         self.AltDriftTarget   = self.sky + math.Rand(-self.AltDriftRange, self.AltDriftRange)
         self.AltDriftNextPick = CurTime() + math.Rand(12, 30)
@@ -272,6 +271,7 @@ function ENT:PhysicsUpdate(phys)
     local jitter     = math.sin(self.JitterPhase) * self.JitterAmplitude
     local liveAlt    = self.AltDriftCurrent + jitter
 
+    -- ── Orbit / sky-wall yaw ────────────────────────────────
     local flatPos    = Vector(pos.x, pos.y, 0)
     local flatCenter = Vector(self.CenterPos.x, self.CenterPos.y, 0)
     local dist       = flatPos:Distance(flatCenter)
@@ -282,33 +282,44 @@ function ENT:PhysicsUpdate(phys)
         self.TurnDelay = CurTime() + 0.02
     end
 
-    local trSky  = util.QuickTrace(self:GetPos(), self:GetForward() * 3000, self)
-    local skyYaw = trSky.HitSky and 0.3 or 0
+    -- Sky-wall avoidance: use flightYaw forward, not GetForward()
+    local flightFwd = Angle(0, self.flightYaw, 0):Forward()
+    local trSky     = util.QuickTrace(pos, flightFwd * 3000, self)
+    local skyYaw    = trSky.HitSky and 0.3 or 0
 
-    self.ang = self.ang + Angle(0, orbitYaw + skyYaw, 0)
+    local yawDelta     = orbitYaw + skyYaw
+    self.flightYaw     = self.flightYaw + yawDelta   -- motion yaw
+    self.ang.y         = self.ang.y + yawDelta        -- keep visual yaw in sync
 
-    local currentYaw  = self.ang.y
-    local rawYawDelta = math.NormalizeAngle(currentYaw - (self.PrevYaw or currentYaw))
-    self.PrevYaw      = currentYaw
+    -- ── Bank / pitch cosmetics ──────────────────────────────
+    local rawYawDelta  = math.NormalizeAngle(self.flightYaw - (self.PrevYaw or self.flightYaw))
+    self.PrevYaw       = self.flightYaw
 
-    local targetRoll  = math.Clamp(rawYawDelta * -18, -15, 15)
-    local rollLerp    = rawYawDelta ~= 0 and 0.08 or 0.03
-    self.SmoothedRoll = Lerp(rollLerp, self.SmoothedRoll, targetRoll)
+    local targetRoll   = math.Clamp(rawYawDelta * -18, -15, 15)
+    local rollLerp     = rawYawDelta ~= 0 and 0.08 or 0.03
+    self.SmoothedRoll  = Lerp(rollLerp, self.SmoothedRoll, targetRoll)
 
-    local vel          = IsValid(phys) and phys:GetVelocity() or Vector(0, 0, 0)
-    local forwardSpeed = vel:Dot(self:GetForward())
-    local speedRatio   = math.Clamp(forwardSpeed / self.Speed, 0, 1)
-    local targetPitch  = math.Clamp(speedRatio * 6, -8, 8)
+    -- Pitch based on actual speed along travel axis
+    local fwdSpeed    = IsValid(phys) and phys:GetVelocity():Dot(flightFwd) or self.Speed
+    local speedRatio  = math.Clamp(fwdSpeed / self.Speed, 0, 1)
+    local targetPitch = math.Clamp(speedRatio * 6, -8, 8)
     self.SmoothedPitch = Lerp(0.02, self.SmoothedPitch, targetPitch)
 
     self.ang.p = self.SmoothedPitch
     self.ang.r = self.SmoothedRoll
 
-    self:SetPos(Vector(pos.x, pos.y, liveAlt))
+    -- ── Kinematic move — fwdDir always from flightYaw ───────
+    -- NEVER use self:GetForward() for movement. Build the direction
+    -- from the stored flightYaw exactly as Foxbat does with _nfpYaw.
+    local fwdDir = Angle(0, self.flightYaw, 0):Forward()
+    local newPos = Vector(pos.x, pos.y, liveAlt) + fwdDir * self.Speed * dt
+
+    self:SetPos(newPos)
     self:SetAngles(self.ang)
 
     if IsValid(phys) then
-        phys:SetVelocity(self:GetForward() * self.Speed)
+        phys:SetPos(newPos)
+        phys:SetVelocity(fwdDir * self.Speed)
     end
 
     if not self:IsInWorld() then
