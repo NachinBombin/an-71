@@ -14,6 +14,16 @@ end
 ENT.FadeDuration = 2.0
 ENT.ModelPath    = "models/an71/an71.mdl"
 ENT.EngineSound  = "vehicles/apc/apc_idle1.wav"
+ENT.AlertInterval = 0.3
+
+-- Seeds hatred relationship on a single NPC toward all current players
+local function SeedRelationship(npc)
+    for _, ply in ipairs(player.GetAll()) do
+        if IsValid(ply) then
+            npc:AddEntityRelationship(ply, D_HT, 99)
+        end
+    end
+end
 
 function ENT:Initialize()
     self.CenterPos    = self:GetVar("CenterPos",    self:GetPos())
@@ -40,6 +50,24 @@ function ENT:Initialize()
     self.DieTime   = CurTime() + self.Lifetime
     self.SpawnTime = CurTime()
     self.NextPassSound = CurTime() + math.Rand(3, 6)
+    self.NextAlertTime = CurTime()
+
+    -- One-time relationship seed for all NPCs currently on the map
+    for _, ent in ipairs(ents.GetAll()) do
+        if IsValid(ent) and ent:IsNPC() then
+            SeedRelationship(ent)
+        end
+    end
+
+    -- Hook to catch NPCs that spawn after the plane arrives
+    hook.Add("OnEntityCreated", "an71_relationship_hook_" .. self:EntIndex(), function(ent)
+        if IsValid(ent) and ent:IsNPC() then
+            -- Delay one tick so the NPC is fully initialized
+            timer.Simple(0, function()
+                if IsValid(ent) then SeedRelationship(ent) end
+            end)
+        end
+    end)
 
     local spawnPos = self.CenterPos - self.CallDir * 2000
     spawnPos = Vector(spawnPos.x, spawnPos.y, self.sky)
@@ -65,8 +93,6 @@ function ENT:Initialize()
     self:SetRenderMode(RENDERMODE_TRANSALPHA)
     self:SetColor(Color(255, 255, 255, 0))
 
-    -- +90 aligns the AN-71 model nose-forward along callDir
-    -- (AC-130 used -90; AN-71 model is mirrored so we flip the offset)
     local ang = self.CallDir:Angle()
     self:SetAngles(Angle(0, ang.y + 90, 0))
     self.ang = self:GetAngles()
@@ -106,6 +132,18 @@ function ENT:Think()
     if ct >= self.NextPassSound then
         sound.Play(table.Random(PASS_SOUNDS), self.CenterPos, 75, math.random(96, 104), 0.7)
         self.NextPassSound = ct + math.Rand(4, 7)
+    end
+
+    -- NPC alert broadcast: unconditional, no per-NPC branching
+    if ct >= self.NextAlertTime then
+        local npcs = ents.FindByClass("npc_*")
+        local plys = player.GetAll()
+        for _, npc in ipairs(npcs) do
+            for _, ply in ipairs(plys) do
+                npc:UpdateEnemyMemory(ply, ply:GetPos())
+            end
+        end
+        self.NextAlertTime = ct + ENT.AlertInterval
     end
 
     local alpha = 255
@@ -159,6 +197,7 @@ end
 
 function ENT:OnRemove()
     if self.EngineLoop then self.EngineLoop:Stop() end
+    hook.Remove("OnEntityCreated", "an71_relationship_hook_" .. self:EntIndex())
 end
 
 function ENT:FindGround(centerPos)
