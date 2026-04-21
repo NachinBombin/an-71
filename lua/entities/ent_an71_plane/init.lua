@@ -3,8 +3,8 @@ AddCSLuaFile("shared.lua")
 include("shared.lua")
 
 local PASS_SOUNDS = {
-    "npc/combine_gunship/gunship_ping_search.wav",
-    "vehicles/airboat/fan_blade_fullthrottle_loop1.wav",
+    "jet/luxor/medium.wav",
+    "jet/luxor/external.wav",
 }
 
 function ENT:Debug(msg)
@@ -94,16 +94,17 @@ function ENT:Initialize()
     self:SetCollisionGroup(COLLISION_GROUP_INTERACTIVE_DEBRIS)
     self:SetPos(spawnPos)
 
+    -- Hide landing gear (bodygroup 0, value 1 = retracted)
+    self:SetBodygroup(0, 1)
+
     self:SetRenderMode(RENDERMODE_TRANSALPHA)
     self:SetColor(Color(255, 255, 255, 0))
 
-    -- self.ang.y = visual yaw (model faces correctly at angYaw + 180)
-    -- self.flightYaw = motion yaw (angYaw + 0) — the direction the nose actually travels
-    -- These are kept separate so the model can be visually correct while
-    -- flight direction is derived independently, never from GetForward().
+    -- self.flightYaw = true motion direction (never +180)
+    -- self.ang.y     = visual yaw (model faces correctly at flightYaw + 180)
     local angYaw       = self.CallDir:Angle().y
-    self.ang           = Angle(0, angYaw + 180, 0)  -- visual
-    self.flightYaw     = angYaw                      -- motion: same real-world direction
+    self.ang           = Angle(0, angYaw + 180, 0)
+    self.flightYaw     = angYaw
     self.PrevYaw       = self.flightYaw
 
     self.AltDriftCurrent  = self.sky
@@ -124,13 +125,19 @@ function ENT:Initialize()
         self.PhysObj:SetAngles(self.ang)
     end
 
+    -- Engine loop: CreateSound gives us a handle so we can Stop() it later
     self.EngineLoop = CreateSound(self, self.EngineSound)
     if self.EngineLoop then
         self.EngineLoop:SetSoundLevel(80)
         self.EngineLoop:Play()
     end
 
-    sound.Play(table.Random(PASS_SOUNDS), self.CenterPos, 75, 100, 0.7)
+    -- NOTE: pass-by sounds use self:EmitSound() instead of the global sound.Play().
+    -- EmitSound ties the sound to the entity so the engine kills it automatically
+    -- when the entity is removed, whether by destruction or natural de-spawn.
+    -- The global sound.Play() has no entity attachment and leaks forever.
+    self:EmitSound(table.Random(PASS_SOUNDS), 75, 100, 0.7)
+
     self:Debug("Spawned at " .. tostring(spawnPos) .. " flightYaw=" .. tostring(self.flightYaw) .. " visualYaw=" .. tostring(self.ang.y))
 end
 
@@ -157,6 +164,12 @@ end
 function ENT:DestroyPlane()
     if self.IsDestroyed then return end
     self.IsDestroyed = true
+
+    -- Stop engine loop immediately on destruction so it doesn't linger
+    if self.EngineLoop then
+        self.EngineLoop:Stop()
+        self.EngineLoop = nil
+    end
 
     local pos = self:GetPos()
 
@@ -213,8 +226,9 @@ function ENT:Think()
         self.PhysObj:Wake()
     end
 
+    -- Pass-by sounds: EmitSound ties them to the entity lifetime
     if ct >= self.NextPassSound then
-        sound.Play(table.Random(PASS_SOUNDS), self.CenterPos, 75, math.random(96, 104), 0.7)
+        self:EmitSound(table.Random(PASS_SOUNDS), 75, math.random(96, 104), 0.7)
         self.NextPassSound = ct + math.Rand(4, 7)
     end
 
@@ -282,14 +296,13 @@ function ENT:PhysicsUpdate(phys)
         self.TurnDelay = CurTime() + 0.02
     end
 
-    -- Sky-wall avoidance: use flightYaw forward, not GetForward()
     local flightFwd = Angle(0, self.flightYaw, 0):Forward()
     local trSky     = util.QuickTrace(pos, flightFwd * 3000, self)
     local skyYaw    = trSky.HitSky and 0.3 or 0
 
-    local yawDelta     = orbitYaw + skyYaw
-    self.flightYaw     = self.flightYaw + yawDelta   -- motion yaw
-    self.ang.y         = self.ang.y + yawDelta        -- keep visual yaw in sync
+    local yawDelta  = orbitYaw + skyYaw
+    self.flightYaw  = self.flightYaw + yawDelta
+    self.ang.y      = self.ang.y + yawDelta
 
     -- ── Bank / pitch cosmetics ──────────────────────────────
     local rawYawDelta  = math.NormalizeAngle(self.flightYaw - (self.PrevYaw or self.flightYaw))
@@ -299,18 +312,15 @@ function ENT:PhysicsUpdate(phys)
     local rollLerp     = rawYawDelta ~= 0 and 0.08 or 0.03
     self.SmoothedRoll  = Lerp(rollLerp, self.SmoothedRoll, targetRoll)
 
-    -- Pitch based on actual speed along travel axis
-    local fwdSpeed    = IsValid(phys) and phys:GetVelocity():Dot(flightFwd) or self.Speed
-    local speedRatio  = math.Clamp(fwdSpeed / self.Speed, 0, 1)
-    local targetPitch = math.Clamp(speedRatio * 6, -8, 8)
+    local fwdSpeed     = IsValid(phys) and phys:GetVelocity():Dot(flightFwd) or self.Speed
+    local speedRatio   = math.Clamp(fwdSpeed / self.Speed, 0, 1)
+    local targetPitch  = math.Clamp(speedRatio * 6, -8, 8)
     self.SmoothedPitch = Lerp(0.02, self.SmoothedPitch, targetPitch)
 
     self.ang.p = self.SmoothedPitch
     self.ang.r = self.SmoothedRoll
 
     -- ── Kinematic move — fwdDir always from flightYaw ───────
-    -- NEVER use self:GetForward() for movement. Build the direction
-    -- from the stored flightYaw exactly as Foxbat does with _nfpYaw.
     local fwdDir = Angle(0, self.flightYaw, 0):Forward()
     local newPos = Vector(pos.x, pos.y, liveAlt) + fwdDir * self.Speed * dt
 
@@ -333,7 +343,12 @@ end
 -- ============================================================
 
 function ENT:OnRemove()
-    if self.EngineLoop then self.EngineLoop:Stop() end
+    -- Stop the engine loop regardless of how the entity dies
+    if self.EngineLoop then
+        self.EngineLoop:Stop()
+        self.EngineLoop = nil
+    end
+    -- EmitSound-based pass-by sounds stop automatically with the entity
     hook.Remove("OnEntityCreated", "an71_relationship_hook_" .. self:EntIndex())
 end
 
