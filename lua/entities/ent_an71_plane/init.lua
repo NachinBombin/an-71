@@ -2,9 +2,6 @@ AddCSLuaFile("cl_init.lua")
 AddCSLuaFile("shared.lua")
 include("shared.lua")
 
--- All ambient sounds are long-form loops — they MUST be managed via CreateSound
--- handles so we can Stop() them explicitly. sound.Play() and EmitSound() have no
--- reliable lifetime tie for long files and will leak on the client.
 local PASS_SOUND_A = "jet/luxor/medium.wav"
 local PASS_SOUND_B = "jet/luxor/external.wav"
 
@@ -28,29 +25,38 @@ end
 -- SOUND HELPERS
 -- ============================================================
 
-function ENT:StopAllSounds(fade)
-    local t = fade or 0
-    local sounds = { self.EngineLoop, self.PassSoundA, self.PassSoundB }
-    for _, snd in ipairs(sounds) do
-        if snd then
-            snd:ChangeVolume(0, t)
-        end
-    end
-    if t > 0 then
-        local ref = self
-        timer.Simple(t + 0.1, function()
-            if ref.EngineLoop  then ref.EngineLoop:Stop()  end
-            if ref.PassSoundA  then ref.PassSoundA:Stop()  end
-            if ref.PassSoundB  then ref.PassSoundB:Stop()  end
-        end)
-    else
-        for _, snd in ipairs(sounds) do
-            if snd then snd:Stop() end
-        end
-    end
+-- Hard-stop all sounds immediately. Safe to call from OnRemove
+-- because CreateSound(self) handles are still valid at that point.
+function ENT:StopAllSounds()
+    if self.EngineLoop then self.EngineLoop:Stop() self.EngineLoop = nil end
+    if self.PassSoundA then self.PassSoundA:Stop() self.PassSoundA = nil end
+    if self.PassSoundB then self.PassSoundB:Stop() self.PassSoundB = nil end
+end
+
+-- Fade out then stop. Used when the plane is destroyed or despawns
+-- naturally so sounds tail off rather than cut abruptly.
+-- NOTE: timer.Simple is safe here because Remove() is called AFTER
+-- this function returns, and the CSoundPatch handle (attached to
+-- game.GetWorld for the purpose of the timer capture) will still
+-- be valid when the timer fires.
+function ENT:FadeAndStopSounds(fadeTime)
+    local t = fadeTime or 0.5
+    local e = self.EngineLoop
+    local a = self.PassSoundA
+    local b = self.PassSoundB
     self.EngineLoop = nil
     self.PassSoundA = nil
     self.PassSoundB = nil
+
+    if e then e:ChangeVolume(0, t) end
+    if a then a:ChangeVolume(0, t) end
+    if b then b:ChangeVolume(0, t) end
+
+    timer.Simple(t + 0.15, function()
+        if e then e:Stop() end
+        if a then a:Stop() end
+        if b then b:Stop() end
+    end)
 end
 
 -- ============================================================
@@ -86,7 +92,6 @@ function ENT:Initialize()
     self.NextAlertTime = CurTime()
     self.IsDestroyed   = false
 
-    -- Seed hatred on every NPC already on the map
     for _, ent in ipairs(ents.GetAll()) do
         if IsValid(ent) and ent:IsNPC() then
             SeedRelationship(ent)
@@ -121,7 +126,7 @@ function ENT:Initialize()
     self:SetCollisionGroup(COLLISION_GROUP_INTERACTIVE_DEBRIS)
     self:SetPos(spawnPos)
 
-    self:SetBodygroup(0, 1)  -- retract landing gear
+    self:SetBodygroup(0, 1) -- retract landing gear
 
     self:SetRenderMode(RENDERMODE_TRANSALPHA)
     self:SetColor(Color(255, 255, 255, 0))
@@ -148,31 +153,32 @@ function ENT:Initialize()
         self.PhysObj:SetAngles(self.ang)
     end
 
-    -- ── Sounds — all via CreateSound(game.GetWorld()) ──────────────────
-    -- Attaching to game.GetWorld() (same as TB2) means the handle is
-    -- never silently freed by the engine when the entity dies, so our
-    -- explicit Stop() calls in StopAllSounds() are always effective.
-    self.EngineLoop = CreateSound(game.GetWorld(), self.EngineSound)
+    -- ── Sounds ─────────────────────────────────────────────────────────
+    -- CreateSound(self, ...) attaches the CSoundPatch to this entity so
+    -- the audio is positional and follows the plane as it moves.
+    -- We keep explicit handles so we can Stop() them cleanly; this avoids
+    -- the leak that EmitSound() causes with long looping files.
+    self.EngineLoop = CreateSound(self, self.EngineSound)
     if self.EngineLoop then
         self.EngineLoop:SetSoundLevel(80)
         self.EngineLoop:ChangePitch(100, 0)
-        self.EngineLoop:ChangeVolume(1.0, 0.5)
+        self.EngineLoop:ChangeVolume(1.0, 0)
         self.EngineLoop:Play()
     end
 
-    self.PassSoundA = CreateSound(game.GetWorld(), PASS_SOUND_A)
+    self.PassSoundA = CreateSound(self, PASS_SOUND_A)
     if self.PassSoundA then
         self.PassSoundA:SetSoundLevel(85)
         self.PassSoundA:ChangePitch(100, 0)
-        self.PassSoundA:ChangeVolume(0.8, 0.5)
+        self.PassSoundA:ChangeVolume(0.8, 0)
         self.PassSoundA:Play()
     end
 
-    self.PassSoundB = CreateSound(game.GetWorld(), PASS_SOUND_B)
+    self.PassSoundB = CreateSound(self, PASS_SOUND_B)
     if self.PassSoundB then
         self.PassSoundB:SetSoundLevel(80)
         self.PassSoundB:ChangePitch(100, 0)
-        self.PassSoundB:ChangeVolume(0.6, 0.5)
+        self.PassSoundB:ChangeVolume(0.6, 0)
         self.PassSoundB:Play()
     end
 
@@ -202,8 +208,9 @@ function ENT:DestroyPlane()
     if self.IsDestroyed then return end
     self.IsDestroyed = true
 
-    -- Fade out all sounds over 0.5s then stop them
-    self:StopAllSounds(0.5)
+    -- Fade sounds out over 0.5s; Remove() fires immediately after so
+    -- the timer captures the handles before they are nilled.
+    self:FadeAndStopSounds(0.5)
 
     local pos = self:GetPos()
 
@@ -370,8 +377,9 @@ end
 -- ============================================================
 
 function ENT:OnRemove()
-    -- TB2 pattern: fade volume down first, then stop after the fade
-    self:StopAllSounds(0.5)
+    -- Hard-stop synchronously — no timer needed here because OnRemove
+    -- fires while the entity (and its CSoundPatch handles) are still valid.
+    self:StopAllSounds()
     hook.Remove("OnEntityCreated", "an71_relationship_hook_" .. self:EntIndex())
 end
 
