@@ -6,23 +6,25 @@ if SERVER then
 
     local SHARED_FLAGS = bit.bor(FCVAR_ARCHIVE, FCVAR_REPLICATED, FCVAR_NOTIFY)
 
-    local cv_enabled  = CreateConVar("npc_an71_enabled",  "1",    SHARED_FLAGS, "Enable/disable AN-71 flyovers.")
-    local cv_chance   = CreateConVar("npc_an71_chance",   "0.12", SHARED_FLAGS, "Probability per check.")
-    local cv_interval = CreateConVar("npc_an71_interval", "12",   SHARED_FLAGS, "Check interval.")
-    local cv_cooldown = CreateConVar("npc_an71_cooldown", "50",   SHARED_FLAGS, "Cooldown.")
-    local cv_max_dist = CreateConVar("npc_an71_max_dist", "3000", SHARED_FLAGS, "Max distance.")
-    local cv_min_dist = CreateConVar("npc_an71_min_dist", "400",  SHARED_FLAGS, "Min distance.")
-    local cv_delay    = CreateConVar("npc_an71_delay",    "5",    SHARED_FLAGS, "Delay after flare before plane arrives.")
-    local cv_life     = CreateConVar("npc_an71_lifetime", "40",   SHARED_FLAGS, "Plane lifetime.")
-    local cv_speed    = CreateConVar("npc_an71_speed",    "300",  SHARED_FLAGS, "Plane forward speed.")
-    local cv_radius   = CreateConVar("npc_an71_radius",   "3000", SHARED_FLAGS, "Orbit radius.")
-    local cv_height   = CreateConVar("npc_an71_height",   "6000", SHARED_FLAGS, "Height above detected ground.")
-    local cv_announce = CreateConVar("npc_an71_announce", "0",    SHARED_FLAGS, "Debug prints.")
+    local cv_enabled    = CreateConVar("npc_an71_enabled",    "1",    SHARED_FLAGS, "Enable/disable AN-71 flyovers.")
+    local cv_chance     = CreateConVar("npc_an71_chance",     "0.12", SHARED_FLAGS, "Probability per check.")
+    local cv_interval   = CreateConVar("npc_an71_interval",   "12",   SHARED_FLAGS, "Check interval (s).")
+    local cv_cooldown   = CreateConVar("npc_an71_cooldown",   "50",   SHARED_FLAGS, "Cooldown (s).")
+    local cv_max_dist   = CreateConVar("npc_an71_max_dist",   "3000", SHARED_FLAGS, "Max NPC-target distance.")
+    local cv_min_dist   = CreateConVar("npc_an71_min_dist",   "400",  SHARED_FLAGS, "Min NPC-target distance.")
+    local cv_delay      = CreateConVar("npc_an71_delay",      "5",    SHARED_FLAGS, "Delay after flare (s).")
+    local cv_life       = CreateConVar("npc_an71_lifetime",   "40",   SHARED_FLAGS, "Plane lifetime (s).")
+    local cv_speed      = CreateConVar("npc_an71_speed",      "300",  SHARED_FLAGS, "Plane speed (HU/s).")
+    local cv_radius     = CreateConVar("npc_an71_radius",     "3000", SHARED_FLAGS, "Orbit radius (HU).")
+    local cv_height     = CreateConVar("npc_an71_height",     "6000", SHARED_FLAGS, "Height above ground (HU).")
+    local cv_announce   = CreateConVar("npc_an71_announce",   "0",    SHARED_FLAGS, "Debug prints.")
+    -- Model yaw offset toggle: 0 = ang.y - 90 (same as AC-130), 1 = ang.y + 90
+    CreateConVar("npc_an71_model_flip", "0", SHARED_FLAGS, "Flip model yaw offset: 0=same as AC-130 (-90), 1=flipped (+90).")
 
     local CALLERS = {
-        ["npc_combine_s"]      = true,
-        ["npc_metropolice"]    = true,
-        ["npc_combine_elite"]  = true,
+        ["npc_combine_s"]     = true,
+        ["npc_metropolice"]   = true,
+        ["npc_combine_elite"] = true,
     }
 
     local function AN71_Debug(msg)
@@ -30,24 +32,22 @@ if SERVER then
         local full = "[AN-71] " .. msg
         print(full)
         for _, ply in ipairs(player.GetHumans()) do
-            if IsValid(ply) then
-                ply:PrintMessage(HUD_PRINTCONSOLE, full)
-            end
+            if IsValid(ply) then ply:PrintMessage(HUD_PRINTCONSOLE, full) end
         end
     end
 
     local function CheckSkyAbove(pos)
-        local trace = util.TraceLine({
+        local tr = util.TraceLine({
             start  = pos + Vector(0, 0, 50),
             endpos = pos + Vector(0, 0, 1050),
         })
-        if trace.Hit and not trace.HitSky then
-            trace = util.TraceLine({
-                start  = trace.HitPos + Vector(0, 0, 50),
-                endpos = trace.HitPos + Vector(0, 0, 1000),
+        if tr.Hit and not tr.HitSky then
+            tr = util.TraceLine({
+                start  = tr.HitPos + Vector(0, 0, 50),
+                endpos = tr.HitPos + Vector(0, 0, 1000),
             })
         end
-        return not (trace.Hit and not trace.HitSky)
+        return not (tr.Hit and not tr.HitSky)
     end
 
     local function ThrowSupportFlare(npc, targetPos)
@@ -112,7 +112,7 @@ if SERVER then
         plane:Activate()
 
         if not IsValid(plane) then
-            AN71_Debug("Plane spawn failed: invalid after Spawn()")
+            AN71_Debug("Plane invalid after Spawn()")
             return false
         end
 
@@ -147,7 +147,7 @@ if SERVER then
         local fallbackPos = Vector(targetPos.x, targetPos.y, targetPos.z)
         local storedDir   = Vector(callDir.x, callDir.y, callDir.z)
 
-        AN71_Debug("Flare deployed, waiting " .. tostring(cv_delay:GetFloat()) .. "s before plane spawn")
+        AN71_Debug("Flare deployed, waiting " .. cv_delay:GetFloat() .. "s")
 
         timer.Simple(cv_delay:GetFloat(), function()
             local centerPos = IsValid(flare) and flare:GetPos() or fallbackPos
@@ -158,20 +158,19 @@ if SERVER then
         return true
     end
 
-    -- ─── Manual spawn via net message ──────────────────────
+    -- Manual spawn via Q-menu button
     net.Receive("AN71_ManualSpawn", function(len, ply)
         if not IsValid(ply) then return end
-        local eyePos = ply:EyePos()
-        local eyeAng = ply:EyeAngles()
-        local callDir = eyeAng:Forward()
+        local eyePos  = ply:EyePos()
+        local callDir = ply:EyeAngles():Forward()
         callDir.z = 0
         if callDir:LengthSqr() <= 1 then callDir = Vector(1, 0, 0) end
         callDir:Normalize()
         SpawnAN71AtPos(eyePos, callDir)
-        AN71_Debug("Manual spawn triggered by " .. ply:Nick())
+        AN71_Debug("Manual spawn by " .. ply:Nick())
     end)
 
-    -- ─── NPC trigger loop ───────────────────────────────────
+    -- NPC trigger loop
     timer.Create("AN71_Think", 0.5, 0, function()
         if not cv_enabled:GetBool() then return end
 
@@ -182,9 +181,9 @@ if SERVER then
             if not IsValid(npc) or not CALLERS[npc:GetClass()] then continue end
 
             if not npc.__an71_hooked then
-                npc.__an71_hooked      = true
-                npc.__an71_nextCheck   = now + math.Rand(1, interval)
-                npc.__an71_lastCall    = 0
+                npc.__an71_hooked    = true
+                npc.__an71_nextCheck = now + math.Rand(1, interval)
+                npc.__an71_lastCall  = 0
             end
 
             if now < npc.__an71_nextCheck then continue end
@@ -204,7 +203,7 @@ if SERVER then
 
             if FireAN71(npc, enemy) then
                 npc.__an71_lastCall = now
-                AN71_Debug("AN-71 flyover accepted for " .. tostring(enemy))
+                AN71_Debug("Flyover accepted for " .. tostring(enemy))
             end
         end
     end)
