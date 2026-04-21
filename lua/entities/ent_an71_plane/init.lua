@@ -97,10 +97,12 @@ function ENT:Initialize()
     self:SetRenderMode(RENDERMODE_TRANSALPHA)
     self:SetColor(Color(255, 255, 255, 0))
 
-    -- +90 confirmed correct via in-game bone manipulation test
+    -- Build self.ang directly — never read back via GetAngles() on a VPHYSICS entity
+    -- because the physics object owns the true rotation and GetAngles() may return stale data.
+    -- PhysicsUpdate applies self.ang to both entity and physobj every tick.
     local angYaw = self.CallDir:Angle().y
-    self:SetAngles(Angle(0, angYaw + 90, 0))
-    self.ang = self:GetAngles()
+    self.ang = Angle(0, angYaw + 180, 0)
+    self.PrevYaw = self.ang.y  -- seed from self.ang, not GetAngles()
 
     self.AltDriftCurrent  = self.sky
     self.AltDriftTarget   = self.sky
@@ -109,7 +111,6 @@ function ENT:Initialize()
     self.JitterPhase   = math.Rand(0, math.pi * 2)
     self.SmoothedRoll  = 0
     self.SmoothedPitch = 0
-    self.PrevYaw       = self:GetAngles().y
 
     self:SetNWInt("HP",    self.MaxHP)
     self:SetNWInt("MaxHP", self.MaxHP)
@@ -118,6 +119,8 @@ function ENT:Initialize()
     if IsValid(self.PhysObj) then
         self.PhysObj:Wake()
         self.PhysObj:EnableGravity(false)
+        -- Apply the correct angle to the physobj directly at spawn
+        self.PhysObj:SetAngles(self.ang)
     end
 
     self.EngineLoop = CreateSound(self, self.EngineSound)
@@ -127,7 +130,7 @@ function ENT:Initialize()
     end
 
     sound.Play(table.Random(PASS_SOUNDS), self.CenterPos, 75, 100, 0.7)
-    self:Debug("Spawned at " .. tostring(spawnPos))
+    self:Debug("Spawned at " .. tostring(spawnPos) .. " yaw=" .. tostring(self.ang.y))
 end
 
 -- ============================================================
