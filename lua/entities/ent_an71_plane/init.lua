@@ -97,9 +97,9 @@ function ENT:Initialize()
     self:SetRenderMode(RENDERMODE_TRANSALPHA)
     self:SetColor(Color(255, 255, 255, 0))
 
+    -- +90 confirmed correct via in-game bone manipulation test
     local angYaw = self.CallDir:Angle().y
-    local flip   = GetConVar("npc_an71_model_flip") and GetConVar("npc_an71_model_flip"):GetBool()
-    self:SetAngles(Angle(0, angYaw + (flip and 90 or -90), 0))
+    self:SetAngles(Angle(0, angYaw + 90, 0))
     self.ang = self:GetAngles()
 
     self.AltDriftCurrent  = self.sky
@@ -226,7 +226,7 @@ function ENT:Think()
                 end
             end
         end
-        self.NextAlertTime = ct + self.AlertInterval  -- self, not ENT
+        self.NextAlertTime = ct + self.AlertInterval
     end
 
     -- Fade in / out
