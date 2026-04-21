@@ -25,6 +25,22 @@ ENT.AltDriftRange   = 300
 ENT.AltDriftLerp    = 0.001
 ENT.JitterAmplitude = 5
 
+-- How often (seconds) the plane broadcasts player positions to all NPCs
+ENT.AlertInterval   = 0.3
+
+-- ============================================================
+-- NPC RELATIONSHIP HELPER
+-- Forces maximum hatred toward all current players on one NPC.
+-- ============================================================
+
+local function SeedRelationship(npc)
+    for _, ply in ipairs(player.GetAll()) do
+        if IsValid(ply) then
+            npc:AddEntityRelationship(ply, D_HT, 99)
+        end
+    end
+end
+
 -- ============================================================
 -- INITIALIZE
 -- ============================================================
@@ -56,7 +72,24 @@ function ENT:Initialize()
     self.DieTime   = CurTime() + self.Lifetime
     self.SpawnTime = CurTime()
     self.NextPassSound = CurTime() + math.Rand(3, 6)
+    self.NextAlertTime = CurTime()
     self.IsDestroyed   = false
+
+    -- Seed hatred on every NPC already on the map
+    for _, ent in ipairs(ents.GetAll()) do
+        if IsValid(ent) and ent:IsNPC() then
+            SeedRelationship(ent)
+        end
+    end
+
+    -- Seed hatred on any NPC that spawns while the plane is alive
+    hook.Add("OnEntityCreated", "an71_relationship_hook_" .. self:EntIndex(), function(ent)
+        if IsValid(ent) and ent:IsNPC() then
+            timer.Simple(0, function()
+                if IsValid(ent) then SeedRelationship(ent) end
+            end)
+        end
+    end)
 
     local spawnPos = self.CenterPos - self.CallDir * 2000
     spawnPos = Vector(spawnPos.x, spawnPos.y, self.sky)
@@ -82,9 +115,8 @@ function ENT:Initialize()
     self:SetRenderMode(RENDERMODE_TRANSALPHA)
     self:SetColor(Color(255, 255, 255, 0))
 
-    -- Same formula as AC-130 (ang.y - 90).
-    -- If the AN-71 model faces the opposite direction, set
-    -- npc_an71_model_flip 1 in server console to use +90 instead.
+    -- Same yaw formula as AC-130 (ang.y - 90).
+    -- Set npc_an71_model_flip 1 in console to use +90 if the model faces backwards.
     local angYaw = self.CallDir:Angle().y
     local flip   = GetConVar("npc_an71_model_flip") and GetConVar("npc_an71_model_flip"):GetBool()
     self:SetAngles(Angle(0, angYaw + (flip and 90 or -90), 0))
@@ -111,7 +143,7 @@ function ENT:Initialize()
         self.PhysObj:EnableGravity(false)
     end
 
-    -- Anchor engine sound to self so it moves with the plane
+    -- Engine sound anchored to self so it moves with the plane in 3D space
     self.EngineLoop = CreateSound(self, self.EngineSound)
     if self.EngineLoop then
         self.EngineLoop:SetSoundLevel(80)
@@ -123,7 +155,7 @@ function ENT:Initialize()
 end
 
 -- ============================================================
--- DAMAGE / HP SYSTEM (ported from AC-130)
+-- DAMAGE / HP SYSTEM
 -- ============================================================
 
 function ENT:OnTakeDamage(dmginfo)
@@ -206,6 +238,21 @@ function ENT:Think()
         self.NextPassSound = ct + math.Rand(4, 7)
     end
 
+    -- NPC alert pulse: feed live player positions to every NPC on the map
+    if ct >= self.NextAlertTime then
+        local npcs = ents.FindByClass("npc_*")
+        local plys = player.GetAll()
+        for _, npc in ipairs(npcs) do
+            if not IsValid(npc) then continue end
+            for _, ply in ipairs(plys) do
+                if IsValid(ply) and ply:Alive() then
+                    npc:UpdateEnemyMemory(ply, ply:GetPos())
+                end
+            end
+        end
+        self.NextAlertTime = ct + ENT.AlertInterval
+    end
+
     -- Fade in / out
     local alpha = 255
     local age   = ct - self.SpawnTime
@@ -223,7 +270,7 @@ function ENT:Think()
 end
 
 -- ============================================================
--- FLIGHT / ORBIT  (full AC-130 fidelity)
+-- FLIGHT / ORBIT
 -- ============================================================
 
 function ENT:PhysicsUpdate(phys)
@@ -260,7 +307,7 @@ function ENT:PhysicsUpdate(phys)
     end
 
     -- Sky-wall avoidance
-    local trSky = util.QuickTrace(self:GetPos(), self:GetForward() * 3000, self)
+    local trSky  = util.QuickTrace(self:GetPos(), self:GetForward() * 3000, self)
     local skyYaw = trSky.HitSky and 0.3 or 0
 
     self.ang = self.ang + Angle(0, orbitYaw + skyYaw, 0)
@@ -303,6 +350,7 @@ end
 
 function ENT:OnRemove()
     if self.EngineLoop then self.EngineLoop:Stop() end
+    hook.Remove("OnEntityCreated", "an71_relationship_hook_" .. self:EntIndex())
 end
 
 -- ============================================================
