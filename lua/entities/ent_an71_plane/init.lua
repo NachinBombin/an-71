@@ -12,25 +12,7 @@ function ENT:Debug(msg)
 end
 
 -- ============================================================
--- TUNING
--- ============================================================
-
-ENT.FadeDuration    = 2.0
-ENT.ModelPath       = "models/an71/an71.mdl"
-ENT.EngineSound     = "vehicles/apc/apc_idle1.wav"
-
-ENT.MaxHP           = 8000
-
-ENT.AltDriftRange   = 300
-ENT.AltDriftLerp    = 0.001
-ENT.JitterAmplitude = 5
-
--- How often (seconds) the plane broadcasts player positions to all NPCs
-ENT.AlertInterval   = 0.3
-
--- ============================================================
 -- NPC RELATIONSHIP HELPER
--- Forces maximum hatred toward all current players on one NPC.
 -- ============================================================
 
 local function SeedRelationship(npc)
@@ -53,7 +35,7 @@ function ENT:Initialize()
     self.OrbitRadius  = self:GetVar("OrbitRadius",  3000)
     self.SkyHeightAdd = self:GetVar("SkyHeightAdd", 6000)
 
-    self.MaxHP = self.MaxHP or ENT.MaxHP or 8000
+    self.MaxHP = self.MaxHP or 8000
 
     if self.CallDir:LengthSqr() <= 1 then
         self.CallDir = Vector(1, 0, 0)
@@ -68,9 +50,9 @@ function ENT:Initialize()
         return
     end
 
-    self.sky       = ground + self.SkyHeightAdd
-    self.DieTime   = CurTime() + self.Lifetime
-    self.SpawnTime = CurTime()
+    self.sky           = ground + self.SkyHeightAdd
+    self.DieTime       = CurTime() + self.Lifetime
+    self.SpawnTime     = CurTime()
     self.NextPassSound = CurTime() + math.Rand(3, 6)
     self.NextAlertTime = CurTime()
     self.IsDestroyed   = false
@@ -115,25 +97,20 @@ function ENT:Initialize()
     self:SetRenderMode(RENDERMODE_TRANSALPHA)
     self:SetColor(Color(255, 255, 255, 0))
 
-    -- Same yaw formula as AC-130 (ang.y - 90).
-    -- Set npc_an71_model_flip 1 in console to use +90 if the model faces backwards.
     local angYaw = self.CallDir:Angle().y
     local flip   = GetConVar("npc_an71_model_flip") and GetConVar("npc_an71_model_flip"):GetBool()
     self:SetAngles(Angle(0, angYaw + (flip and 90 or -90), 0))
     self.ang = self:GetAngles()
 
-    -- Altitude drift state
     self.AltDriftCurrent  = self.sky
     self.AltDriftTarget   = self.sky
     self.AltDriftNextPick = CurTime() + math.Rand(12, 30)
 
-    -- Banking state
     self.JitterPhase   = math.Rand(0, math.pi * 2)
     self.SmoothedRoll  = 0
     self.SmoothedPitch = 0
     self.PrevYaw       = self:GetAngles().y
 
-    -- HP network vars
     self:SetNWInt("HP",    self.MaxHP)
     self:SetNWInt("MaxHP", self.MaxHP)
 
@@ -143,7 +120,6 @@ function ENT:Initialize()
         self.PhysObj:EnableGravity(false)
     end
 
-    -- Engine sound anchored to self so it moves with the plane in 3D space
     self.EngineLoop = CreateSound(self, self.EngineSound)
     if self.EngineLoop then
         self.EngineLoop:SetSoundLevel(80)
@@ -250,7 +226,7 @@ function ENT:Think()
                 end
             end
         end
-        self.NextAlertTime = ct + ENT.AlertInterval
+        self.NextAlertTime = ct + self.AlertInterval  -- self, not ENT
     end
 
     -- Fade in / out
@@ -283,19 +259,16 @@ function ENT:PhysicsUpdate(phys)
 
     local pos = self:GetPos()
 
-    -- Altitude drift
     if CurTime() >= self.AltDriftNextPick then
         self.AltDriftTarget   = self.sky + math.Rand(-self.AltDriftRange, self.AltDriftRange)
         self.AltDriftNextPick = CurTime() + math.Rand(12, 30)
     end
     self.AltDriftCurrent = Lerp(self.AltDriftLerp, self.AltDriftCurrent, self.AltDriftTarget)
 
-    -- Sine jitter
     self.JitterPhase = self.JitterPhase + 0.02
     local jitter     = math.sin(self.JitterPhase) * self.JitterAmplitude
     local liveAlt    = self.AltDriftCurrent + jitter
 
-    -- Orbit turn
     local flatPos    = Vector(pos.x, pos.y, 0)
     local flatCenter = Vector(self.CenterPos.x, self.CenterPos.y, 0)
     local dist       = flatPos:Distance(flatCenter)
@@ -306,13 +279,11 @@ function ENT:PhysicsUpdate(phys)
         self.TurnDelay = CurTime() + 0.02
     end
 
-    -- Sky-wall avoidance
     local trSky  = util.QuickTrace(self:GetPos(), self:GetForward() * 3000, self)
     local skyYaw = trSky.HitSky and 0.3 or 0
 
     self.ang = self.ang + Angle(0, orbitYaw + skyYaw, 0)
 
-    -- Smoothed banking roll
     local currentYaw  = self.ang.y
     local rawYawDelta = math.NormalizeAngle(currentYaw - (self.PrevYaw or currentYaw))
     self.PrevYaw      = currentYaw
@@ -321,7 +292,6 @@ function ENT:PhysicsUpdate(phys)
     local rollLerp    = rawYawDelta ~= 0 and 0.08 or 0.03
     self.SmoothedRoll = Lerp(rollLerp, self.SmoothedRoll, targetRoll)
 
-    -- Smoothed pitch from speed
     local vel          = IsValid(phys) and phys:GetVelocity() or Vector(0, 0, 0)
     local forwardSpeed = vel:Dot(self:GetForward())
     local speedRatio   = math.Clamp(forwardSpeed / self.Speed, 0, 1)
