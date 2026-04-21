@@ -16,11 +16,11 @@ ENT.ModelPath    = "models/an71/an71.mdl"
 ENT.EngineSound  = "vehicles/apc/apc_idle1.wav"
 
 function ENT:Initialize()
-    self.CenterPos    = self:GetVar("CenterPos", self:GetPos())
-    self.CallDir      = self:GetVar("CallDir", Vector(1, 0, 0))
-    self.Lifetime     = self:GetVar("Lifetime", 40)
-    self.Speed        = self:GetVar("Speed", 300)
-    self.OrbitRadius  = self:GetVar("OrbitRadius", 3000)
+    self.CenterPos    = self:GetVar("CenterPos",    self:GetPos())
+    self.CallDir      = self:GetVar("CallDir",      Vector(1, 0, 0))
+    self.Lifetime     = self:GetVar("Lifetime",     40)
+    self.Speed        = self:GetVar("Speed",        300)
+    self.OrbitRadius  = self:GetVar("OrbitRadius",  3000)
     self.SkyHeightAdd = self:GetVar("SkyHeightAdd", 6000)
 
     if self.CallDir:LengthSqr() <= 1 then
@@ -36,9 +36,9 @@ function ENT:Initialize()
         return
     end
 
-    self.sky           = ground + self.SkyHeightAdd
-    self.DieTime       = CurTime() + self.Lifetime
-    self.SpawnTime     = CurTime()
+    self.sky       = ground + self.SkyHeightAdd
+    self.DieTime   = CurTime() + self.Lifetime
+    self.SpawnTime = CurTime()
     self.NextPassSound = CurTime() + math.Rand(3, 6)
 
     local spawnPos = self.CenterPos - self.CallDir * 2000
@@ -65,8 +65,10 @@ function ENT:Initialize()
     self:SetRenderMode(RENDERMODE_TRANSALPHA)
     self:SetColor(Color(255, 255, 255, 0))
 
+    -- +90 aligns the AN-71 model nose-forward along callDir
+    -- (AC-130 used -90; AN-71 model is mirrored so we flip the offset)
     local ang = self.CallDir:Angle()
-    self:SetAngles(Angle(0, ang.y - 90, 0))
+    self:SetAngles(Angle(0, ang.y + 90, 0))
     self.ang = self:GetAngles()
 
     self.PhysObj = self:GetPhysicsObject()
@@ -111,7 +113,7 @@ function ENT:Think()
     local left  = self.DieTime - ct
 
     if age < self.FadeDuration then
-        alpha = math.Clamp(255 * (age / self.FadeDuration), 0, 255)
+        alpha = math.Clamp(255 * (age  / self.FadeDuration), 0, 255)
     elseif left < self.FadeDuration then
         alpha = math.Clamp(255 * (left / self.FadeDuration), 0, 255)
     end
@@ -140,7 +142,7 @@ function ENT:PhysicsUpdate(phys)
     local dist       = flatPos:Distance(flatCenter)
 
     if dist > self.OrbitRadius and (self.TurnDelay or 0) < CurTime() then
-        self.ang = self.ang + Angle(0, 0.1, 0)
+        self.ang       = self.ang + Angle(0, 0.1, 0)
         self.TurnDelay = CurTime() + 0.02
     end
 
