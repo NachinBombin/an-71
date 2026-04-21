@@ -7,6 +7,8 @@ local PASS_SOUNDS = {
     "vehicles/airboat/fan_blade_fullthrottle_loop1.wav",
 }
 
+local ALERT_INTERVAL = 0.3
+
 function ENT:Debug(msg)
     print("[AN-71 ENT] " .. msg)
 end
@@ -14,7 +16,6 @@ end
 ENT.FadeDuration = 2.0
 ENT.ModelPath    = "models/an71/an71.mdl"
 ENT.EngineSound  = "vehicles/apc/apc_idle1.wav"
-ENT.AlertInterval = 0.3
 
 -- Seeds hatred relationship on a single NPC toward all current players
 local function SeedRelationship(npc)
@@ -62,7 +63,6 @@ function ENT:Initialize()
     -- Hook to catch NPCs that spawn after the plane arrives
     hook.Add("OnEntityCreated", "an71_relationship_hook_" .. self:EntIndex(), function(ent)
         if IsValid(ent) and ent:IsNPC() then
-            -- Delay one tick so the NPC is fully initialized
             timer.Simple(0, function()
                 if IsValid(ent) then SeedRelationship(ent) end
             end)
@@ -143,7 +143,7 @@ function ENT:Think()
                 npc:UpdateEnemyMemory(ply, ply:GetPos())
             end
         end
-        self.NextAlertTime = ct + ENT.AlertInterval
+        self.NextAlertTime = ct + ALERT_INTERVAL
     end
 
     local alpha = 255
