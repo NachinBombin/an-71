@@ -7,6 +7,10 @@ local PASS_SOUND_B = "jet/luxor/external.wav"
 local SHARD_MODEL  = "models/props_c17/FurnitureDrawer001a_Shard01.mdl"
 local SHARD_LIFE   = 8
 local GRAVITY_MULT = 1.5
+-- +180 offset applied everywhere a tangent yaw is derived from OrbitAngle.
+-- This permanently flips the model to face forward without the correction
+-- loop ever fighting it back.
+local MODEL_YAW_OFFSET = 180
 
 function ENT:Debug(msg)
 	print("[AN-71 ENT] " .. msg)
@@ -128,14 +132,18 @@ function ENT:Initialize()
 	self:SetNWInt("MaxHP", self.MaxHP)
 	self:SetNWBool("Destroyed", false)
 
-	local tangent = Vector(-entryOffset.y, entryOffset.x, 0) * self.OrbitDir
+	-- Tangent yaw + MODEL_YAW_OFFSET so the model faces forward from frame 1.
+	-- PhysicsUpdate uses the same offset when computing tangentYaw, so the
+	-- yaw-correction loop always targets the same orientation and never fights
+	-- the flip back.
+	local tangent  = Vector(-entryOffset.y, entryOffset.x, 0) * self.OrbitDir
 	local startAng = tangent:Angle()
-	self:SetAngles(Angle(0, startAng.y, 0))
-	self.ang = self:GetAngles()
+	self.ang = Angle(0, startAng.y + MODEL_YAW_OFFSET, 0)
+	self:SetAngles(self.ang)
 
 	self.SmoothedRoll  = 0
 	self.SmoothedPitch = 0
-	self.PrevYaw       = self:GetAngles().y
+	self.PrevYaw       = self.ang.y
 
 	self.JitterPhase  = math.Rand(0, math.pi * 2)
 	self.JitterPhase2 = math.Rand(0, math.pi * 2)
@@ -261,11 +269,11 @@ function ENT:SetDestroyed()
 
 	self:Ignite(25, 0)
 	self:SpawnDebrisShards()
-
 	self:FadeAndStopSounds(2.0)
 
+	-- Crash delay: altitude above ground / 1200, clamped 1.5–3s
 	local altAboveGround = self:GetPos().z - (self.sky - self.SkyHeightAdd)
-	local delay = math.Clamp(altAboveGround / 500, 4, 18)
+	local delay = math.Clamp(altAboveGround / 1200, 1.5, 3)
 	self.ExplodeTimer = CurTime() + delay
 
 	self:Debug("DESTROYED -- crash in " .. math.Round(delay,1) .. "s")
@@ -396,14 +404,16 @@ function ENT:PhysicsUpdate(phys)
 		self.BaseCenterPos.z
 	)
 
-	-- Polar orbit angle
+	-- Polar orbit angle advance
 	self.OrbitAngSpeed = (self.Speed / self.OrbitRadius) * self.OrbitDir
 	self.OrbitAngle    = self.OrbitAngle + self.OrbitAngSpeed * dt
 
 	local desiredX = self.CenterPos.x + math.cos(self.OrbitAngle) * self.OrbitRadius
 	local desiredY = self.CenterPos.y + math.sin(self.OrbitAngle) * self.OrbitRadius
 
-	local tangentYaw    = math.deg(self.OrbitAngle) + 90 * self.OrbitDir
+	-- tangentYaw includes MODEL_YAW_OFFSET so the correction loop always
+	-- targets the flipped orientation and never fights the spawn flip.
+	local tangentYaw    = math.deg(self.OrbitAngle) + 90 * self.OrbitDir + MODEL_YAW_OFFSET
 	local yawError      = math.NormalizeAngle(tangentYaw - self.ang.y)
 	local yawCorrection = math.Clamp(yawError * 0.08, -0.6, 0.6)
 	self.ang = self.ang + Angle(0, yawCorrection, 0)
