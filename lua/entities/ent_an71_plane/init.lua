@@ -8,6 +8,10 @@ local SHARD_MODEL  = "models/props_c17/FurnitureDrawer001a_Shard01.mdl"
 local SHARD_LIFE   = 8
 local GRAVITY_MULT = 1.5
 
+-- The an71.mdl nose points along its local +Y axis (90 deg offset from world +X).
+-- So the visual yaw must be flightYaw - 90 to face forward.
+local MODEL_YAW_OFFSET = -90
+
 function ENT:Debug(msg)
 	print("[AN-71 ENT] " .. msg)
 end
@@ -117,10 +121,12 @@ function ENT:Initialize()
 	self:SetNWInt("MaxHP", self.MaxHP)
 	self:SetNWBool("Destroyed", false)
 
-	-- Working forward-facing yaw (restored from last correct version)
+	-- flightYaw: the direction the plane actually moves.
+	-- self.ang.y: the visual yaw = flightYaw + MODEL_YAW_OFFSET.
+	-- These are kept in sync every tick by advancing both by yawDelta.
 	local angYaw   = self.CallDir:Angle().y
-	self.ang       = Angle(0, angYaw + 180, 0)
 	self.flightYaw = angYaw
+	self.ang       = Angle(0, self.flightYaw + MODEL_YAW_OFFSET, 0)
 	self.PrevYaw   = self.flightYaw
 
 	-- Altitude jitter: SCALP dual-sine
@@ -192,8 +198,8 @@ function ENT:IsDestroyedFlag()
 end
 
 function ENT:SpawnDebrisShards()
-	local count  = math.random(2, 4)
-	local origin = self:GetPos()
+	local count   = math.random(2, 4)
+	local origin  = self:GetPos()
 	local baseVel = self:GetVelocity()
 
 	for i = 1, count do
@@ -298,7 +304,6 @@ function ENT:Think()
 	end
 
 	if self:IsDestroyedFlag() then
-		-- Check if crash timer elapsed (fallback for when trace doesn't catch ground)
 		if self.ExplodeTimer and ct >= self.ExplodeTimer then
 			self:CrashExplode(self:GetPos())
 		end
@@ -349,15 +354,12 @@ function ENT:PhysicsUpdate(phys)
 		local dt = FrameTime()
 		if dt <= 0 then dt = 0.01 end
 
-		-- Sustain spin
 		local angVel = phys:GetAngleVelocity()
 		phys:AddAngleVelocity(angVel * 0.08 * dt * 60)
 
-		-- Extra gravity punch
 		local extraG = -600 * (GRAVITY_MULT - 1) * phys:GetMass()
 		phys:ApplyForceCenter(Vector(0, 0, extraG))
 
-		-- Ground impact detection
 		local pos  = self:GetPos()
 		local vel  = phys:GetVelocity()
 		local next = pos + vel * dt + Vector(0, 0, -24)
@@ -371,7 +373,7 @@ function ENT:PhysicsUpdate(phys)
 		return
 	end
 
-	-- ---- Normal flight (working forward-facing system, exact from AN-71 ref) ----
+	-- ---- Normal flight ----
 	local pos = self:GetPos()
 	local dt  = engine.TickInterval()
 
@@ -381,7 +383,7 @@ function ENT:PhysicsUpdate(phys)
 	local jitter = math.sin(self.JitterPhase)  * self.JitterAmp1
 	             + math.sin(self.JitterPhase2) * self.JitterAmp2
 
-	-- Altitude drift: SCALP
+	-- Altitude drift
 	if CurTime() >= self.AltDriftNextPick then
 		self.AltDriftTarget   = self.sky + math.Rand(-self.AltDriftRange, self.AltDriftRange)
 		self.AltDriftNextPick = CurTime() + math.Rand(10, 25)
@@ -389,7 +391,7 @@ function ENT:PhysicsUpdate(phys)
 	self.AltDriftCurrent = Lerp(self.AltDriftLerp, self.AltDriftCurrent, self.AltDriftTarget)
 	local liveAlt = self.AltDriftCurrent + jitter
 
-	-- Orbit / sky-wall yaw (working system from AN-71 ref)
+	-- Orbit / sky-wall yaw
 	local flatPos    = Vector(pos.x, pos.y, 0)
 	local flatCenter = Vector(self.CenterPos.x, self.CenterPos.y, 0)
 	local dist       = flatPos:Distance(flatCenter)
@@ -406,9 +408,11 @@ function ENT:PhysicsUpdate(phys)
 
 	local yawDelta = orbitYaw + skyYaw
 	self.flightYaw = self.flightYaw + yawDelta
-	self.ang.y     = self.ang.y     + yawDelta
+	-- Visual yaw tracks flight yaw with the fixed model offset.
+	-- Both advance by the same yawDelta so they never drift apart.
+	self.ang.y     = self.flightYaw + MODEL_YAW_OFFSET
 
-	-- Bank / pitch cosmetics (SCALP values)
+	-- Bank / pitch cosmetics
 	local rawYawDelta = math.NormalizeAngle(self.flightYaw - (self.PrevYaw or self.flightYaw))
 	self.PrevYaw      = self.flightYaw
 
