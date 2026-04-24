@@ -4,9 +4,12 @@ include("shared.lua")
 
 local PASS_SOUND_A = "jet/luxor/medium.wav"
 local PASS_SOUND_B = "jet/luxor/external.wav"
+local SHARD_MODEL  = "models/props_c17/FurnitureDrawer001a_Shard01.mdl"
+local SHARD_LIFE   = 8
+local GRAVITY_MULT = 1.5
 
 function ENT:Debug(msg)
-    print("[AN-71 ENT] " .. msg)
+	print("[AN-71 ENT] " .. msg)
 end
 
 -- ============================================================
@@ -14,49 +17,41 @@ end
 -- ============================================================
 
 local function SeedRelationship(npc)
-    for _, ply in ipairs(player.GetAll()) do
-        if IsValid(ply) then
-            npc:AddEntityRelationship(ply, D_HT, 99)
-        end
-    end
+	for _, ply in ipairs(player.GetAll()) do
+		if IsValid(ply) then
+			npc:AddEntityRelationship(ply, D_HT, 99)
+		end
+	end
 end
 
 -- ============================================================
 -- SOUND HELPERS
 -- ============================================================
 
--- Hard-stop all sounds immediately. Safe to call from OnRemove
--- because CreateSound(self) handles are still valid at that point.
 function ENT:StopAllSounds()
-    if self.EngineLoop then self.EngineLoop:Stop() self.EngineLoop = nil end
-    if self.PassSoundA then self.PassSoundA:Stop() self.PassSoundA = nil end
-    if self.PassSoundB then self.PassSoundB:Stop() self.PassSoundB = nil end
+	if self.EngineLoop then self.EngineLoop:Stop() self.EngineLoop = nil end
+	if self.PassSoundA then self.PassSoundA:Stop() self.PassSoundA = nil end
+	if self.PassSoundB then self.PassSoundB:Stop() self.PassSoundB = nil end
 end
 
--- Fade out then stop. Used when the plane is destroyed or despawns
--- naturally so sounds tail off rather than cut abruptly.
--- NOTE: timer.Simple is safe here because Remove() is called AFTER
--- this function returns, and the CSoundPatch handle (attached to
--- game.GetWorld for the purpose of the timer capture) will still
--- be valid when the timer fires.
 function ENT:FadeAndStopSounds(fadeTime)
-    local t = fadeTime or 0.5
-    local e = self.EngineLoop
-    local a = self.PassSoundA
-    local b = self.PassSoundB
-    self.EngineLoop = nil
-    self.PassSoundA = nil
-    self.PassSoundB = nil
+	local t = fadeTime or 0.5
+	local e = self.EngineLoop
+	local a = self.PassSoundA
+	local b = self.PassSoundB
+	self.EngineLoop = nil
+	self.PassSoundA = nil
+	self.PassSoundB = nil
 
-    if e then e:ChangeVolume(0, t) end
-    if a then a:ChangeVolume(0, t) end
-    if b then b:ChangeVolume(0, t) end
+	if e then e:ChangeVolume(0, t) end
+	if a then a:ChangeVolume(0, t) end
+	if b then b:ChangeVolume(0, t) end
 
-    timer.Simple(t + 0.15, function()
-        if e then e:Stop() end
-        if a then a:Stop() end
-        if b then b:Stop() end
-    end)
+	timer.Simple(t + 0.15, function()
+		if e then e:Stop() end
+		if a then a:Stop() end
+		if b then b:Stop() end
+	end)
 end
 
 -- ============================================================
@@ -64,125 +59,216 @@ end
 -- ============================================================
 
 function ENT:Initialize()
-    self.CenterPos    = self:GetVar("CenterPos",    self:GetPos())
-    self.CallDir      = self:GetVar("CallDir",      Vector(1, 0, 0))
-    self.Lifetime     = self:GetVar("Lifetime",     40)
-    self.Speed        = self:GetVar("Speed",        300)
-    self.OrbitRadius  = self:GetVar("OrbitRadius",  3000)
-    self.SkyHeightAdd = self:GetVar("SkyHeightAdd", 6000)
+	self.CenterPos    = self:GetVar("CenterPos",    self:GetPos())
+	self.CallDir      = self:GetVar("CallDir",      Vector(1, 0, 0))
+	self.Lifetime     = self:GetVar("Lifetime",     40)
+	self.SkyHeightAdd = self:GetVar("SkyHeightAdd", 6000)
 
-    self.MaxHP = self.MaxHP or 8000
+	self.MaxHP = self.MaxHP or 8000
 
-    if self.CallDir:LengthSqr() <= 1 then
-        self.CallDir = Vector(1, 0, 0)
-    end
-    self.CallDir.z = 0
-    self.CallDir:Normalize()
+	if self.CallDir:LengthSqr() <= 1 then self.CallDir = Vector(1, 0, 0) end
+	self.CallDir.z = 0
+	self.CallDir:Normalize()
 
-    local ground = self:FindGround(self.CenterPos)
-    if ground == -1 then
-        self:Debug("FindGround failed")
-        self:Remove()
-        return
-    end
+	local ground = self:FindGround(self.CenterPos)
+	if ground == -1 then self:Debug("FindGround failed") self:Remove() return end
 
-    self.sky           = ground + self.SkyHeightAdd
-    self.DieTime       = CurTime() + self.Lifetime
-    self.SpawnTime     = CurTime()
-    self.NextAlertTime = CurTime()
-    self.IsDestroyed   = false
+	local altVariance = self.SkyHeightAdd * 0.25
+	self.sky = ground + self.SkyHeightAdd + math.Rand(-altVariance, altVariance)
 
-    for _, ent in ipairs(ents.GetAll()) do
-        if IsValid(ent) and ent:IsNPC() then
-            SeedRelationship(ent)
-        end
-    end
+	self.DieTime       = CurTime() + self.Lifetime
+	self.SpawnTime     = CurTime()
+	self.NextAlertTime = CurTime()
 
-    hook.Add("OnEntityCreated", "an71_relationship_hook_" .. self:EntIndex(), function(ent)
-        if IsValid(ent) and ent:IsNPC() then
-            timer.Simple(0, function()
-                if IsValid(ent) then SeedRelationship(ent) end
-            end)
-        end
-    end)
+	for _, ent in ipairs(ents.GetAll()) do
+		if IsValid(ent) and ent:IsNPC() then SeedRelationship(ent) end
+	end
 
-    local spawnPos = self.CenterPos - self.CallDir * 2000
-    spawnPos = Vector(spawnPos.x, spawnPos.y, self.sky)
+	hook.Add("OnEntityCreated", "an71_relationship_hook_" .. self:EntIndex(), function(ent)
+		if IsValid(ent) and ent:IsNPC() then
+			timer.Simple(0, function() if IsValid(ent) then SeedRelationship(ent) end end)
+		end
+	end)
 
-    if not util.IsInWorld(spawnPos) then
-        self:Debug("Primary spawnPos out of world, trying center fallback")
-        spawnPos = Vector(self.CenterPos.x, self.CenterPos.y, self.sky)
-    end
-    if not util.IsInWorld(spawnPos) then
-        self:Debug("Fallback spawnPos out of world too")
-        self:Remove()
-        return
-    end
+	-- Polar orbit setup
+	local baseRadius = self:GetVar("OrbitRadius", 3000)
+	local baseSpeed  = self:GetVar("Speed",        300)
+	self.OrbitRadius = baseRadius * math.Rand(0.82, 1.18)
+	self.Speed       = baseSpeed  * math.Rand(0.85, 1.15)
+	self.OrbitDir    = (math.random(0, 1) == 0) and 1 or -1
 
-    self:SetModel(self.ModelPath)
-    self:PhysicsInit(SOLID_VPHYSICS)
-    self:SetMoveType(MOVETYPE_VPHYSICS)
-    self:SetSolid(SOLID_VPHYSICS)
-    self:SetCollisionGroup(COLLISION_GROUP_INTERACTIVE_DEBRIS)
-    self:SetPos(spawnPos)
+	self.OrbitAngle    = math.Rand(0, math.pi * 2)
+	self.OrbitAngSpeed = (self.Speed / self.OrbitRadius) * self.OrbitDir
 
-    self:SetBodygroup(0, 1) -- retract landing gear
+	local entryRad    = self.OrbitAngle
+	local entryOffset = Vector(math.cos(entryRad), math.sin(entryRad), 0)
+	local spawnPos    = self.CenterPos + entryOffset * (self.OrbitRadius * 1.05)
+	spawnPos.z        = self.sky
 
-    self:SetRenderMode(RENDERMODE_TRANSALPHA)
-    self:SetColor(Color(255, 255, 255, 0))
+	if not util.IsInWorld(spawnPos) then
+		spawnPos = Vector(self.CenterPos.x, self.CenterPos.y, self.sky)
+	end
+	if not util.IsInWorld(spawnPos) then
+		self:Debug("Spawn position out of world") self:Remove() return
+	end
 
-    local angYaw   = self.CallDir:Angle().y
-    self.ang       = Angle(0, angYaw + 180, 0)
-    self.flightYaw = angYaw
-    self.PrevYaw   = self.flightYaw
+	self:SetModel(self.ModelPath)
+	self:PhysicsInit(SOLID_VPHYSICS)
+	self:SetMoveType(MOVETYPE_VPHYSICS)
+	self:SetSolid(SOLID_VPHYSICS)
+	self:SetCollisionGroup(COLLISION_GROUP_INTERACTIVE_DEBRIS)
+	self:SetPos(spawnPos)
 
-    self.AltDriftCurrent  = self.sky
-    self.AltDriftTarget   = self.sky
-    self.AltDriftNextPick = CurTime() + math.Rand(12, 30)
-    self.JitterPhase      = math.Rand(0, math.pi * 2)
-    self.SmoothedRoll     = 0
-    self.SmoothedPitch    = 0
+	self:SetBodygroup(0, 1)
 
-    self:SetNWInt("HP",    self.MaxHP)
-    self:SetNWInt("MaxHP", self.MaxHP)
+	self:SetRenderMode(RENDERMODE_TRANSALPHA)
+	self:SetColor(Color(255, 255, 255, 0))
 
-    self.PhysObj = self:GetPhysicsObject()
-    if IsValid(self.PhysObj) then
-        self.PhysObj:Wake()
-        self.PhysObj:EnableGravity(false)
-        self.PhysObj:SetAngles(self.ang)
-    end
+	self:SetNWInt("HP",    self.MaxHP)
+	self:SetNWInt("MaxHP", self.MaxHP)
+	self:SetNWBool("Destroyed", false)
 
-    -- ── Sounds ─────────────────────────────────────────────────────────
-    -- CreateSound(self, ...) attaches the CSoundPatch to this entity so
-    -- the audio is positional and follows the plane as it moves.
-    -- We keep explicit handles so we can Stop() them cleanly; this avoids
-    -- the leak that EmitSound() causes with long looping files.
-    self.EngineLoop = CreateSound(self, self.EngineSound)
-    if self.EngineLoop then
-        self.EngineLoop:SetSoundLevel(80)
-        self.EngineLoop:ChangePitch(100, 0)
-        self.EngineLoop:ChangeVolume(1.0, 0)
-        self.EngineLoop:Play()
-    end
+	local tangent = Vector(-entryOffset.y, entryOffset.x, 0) * self.OrbitDir
+	local startAng = tangent:Angle()
+	self:SetAngles(Angle(0, startAng.y, 0))
+	self.ang = self:GetAngles()
 
-    self.PassSoundA = CreateSound(self, PASS_SOUND_A)
-    if self.PassSoundA then
-        self.PassSoundA:SetSoundLevel(85)
-        self.PassSoundA:ChangePitch(100, 0)
-        self.PassSoundA:ChangeVolume(0.8, 0)
-        self.PassSoundA:Play()
-    end
+	self.SmoothedRoll  = 0
+	self.SmoothedPitch = 0
+	self.PrevYaw       = self:GetAngles().y
 
-    self.PassSoundB = CreateSound(self, PASS_SOUND_B)
-    if self.PassSoundB then
-        self.PassSoundB:SetSoundLevel(80)
-        self.PassSoundB:ChangePitch(100, 0)
-        self.PassSoundB:ChangeVolume(0.6, 0)
-        self.PassSoundB:Play()
-    end
+	self.JitterPhase  = math.Rand(0, math.pi * 2)
+	self.JitterPhase2 = math.Rand(0, math.pi * 2)
+	self.JitterAmp1   = math.Rand(8,  18)
+	self.JitterAmp2   = math.Rand(20, 45)
+	self.JitterRate1  = math.Rand(0.030, 0.060)
+	self.JitterRate2  = math.Rand(0.007, 0.015)
 
-    self:Debug("Spawned at " .. tostring(spawnPos) .. " flightYaw=" .. tostring(self.flightYaw) .. " visualYaw=" .. tostring(self.ang.y))
+	self.AltDriftCurrent  = self.sky
+	self.AltDriftTarget   = self.sky
+	self.AltDriftNextPick = CurTime() + math.Rand(12, 30)
+
+	self.BaseCenterPos = Vector(self.CenterPos.x, self.CenterPos.y, self.CenterPos.z)
+	self.WanderPhaseX  = math.Rand(0, math.pi * 2)
+	self.WanderPhaseY  = math.Rand(0, math.pi * 2)
+	self.WanderAmp     = math.Rand(60, 160)
+	self.WanderRateX   = math.Rand(0.004, 0.010)
+	self.WanderRateY   = math.Rand(0.003, 0.009)
+
+	self.PhysObj = self:GetPhysicsObject()
+	if IsValid(self.PhysObj) then
+		self.PhysObj:Wake()
+		self.PhysObj:EnableGravity(false)
+	end
+
+	-- Death tumble state
+	self.Destroyed       = false
+	self.DestroyedTime   = nil
+	self.TumbleAngVel    = Vector(0,0,0)
+	self.ExplodeTimer    = nil
+	self.ExplodedAlready = false
+
+	-- Sounds
+	self.EngineLoop = CreateSound(self, self.EngineSound)
+	if self.EngineLoop then
+		self.EngineLoop:SetSoundLevel(80)
+		self.EngineLoop:ChangePitch(100, 0)
+		self.EngineLoop:ChangeVolume(1.0, 0)
+		self.EngineLoop:Play()
+	end
+
+	self.PassSoundA = CreateSound(self, PASS_SOUND_A)
+	if self.PassSoundA then
+		self.PassSoundA:SetSoundLevel(85)
+		self.PassSoundA:ChangePitch(100, 0)
+		self.PassSoundA:ChangeVolume(0.8, 0)
+		self.PassSoundA:Play()
+	end
+
+	self.PassSoundB = CreateSound(self, PASS_SOUND_B)
+	if self.PassSoundB then
+		self.PassSoundB:SetSoundLevel(80)
+		self.PassSoundB:ChangePitch(100, 0)
+		self.PassSoundB:ChangeVolume(0.6, 0)
+		self.PassSoundB:Play()
+	end
+
+	self:Debug("Spawned at " .. tostring(spawnPos) .. " OrbitDir=" .. self.OrbitDir)
+end
+
+-- ============================================================
+-- DEATH STATE
+-- ============================================================
+
+function ENT:IsDestroyed()
+	return self.Destroyed == true
+end
+
+function ENT:SpawnDebrisShards()
+	local count   = math.random(2, 4)
+	local origin  = self:GetPos()
+	local baseVel = self:GetVelocity()
+
+	for i = 1, count do
+		local shard = ents.Create("prop_physics")
+		if not IsValid(shard) then continue end
+
+		shard:SetModel(SHARD_MODEL)
+		shard:SetPos(origin + Vector(math.Rand(-60,60), math.Rand(-60,60), math.Rand(-40,40)))
+		shard:SetAngles(Angle(math.Rand(0,360), math.Rand(0,360), math.Rand(0,360)))
+		shard:Spawn()
+		shard:Activate()
+		shard:SetColor(Color(15, 10, 10, 255))
+		shard:SetMaterial("models/debug/debugwhite")
+
+		local phys = shard:GetPhysicsObject()
+		if IsValid(phys) then
+			phys:Wake()
+			phys:SetVelocity(baseVel * 0.3 + Vector(
+				math.Rand(-400, 400),
+				math.Rand(-400, 400),
+				math.Rand(100, 350)
+			))
+			phys:AddAngleVelocity(Vector(
+				math.Rand(-300, 300),
+				math.Rand(-300, 300),
+				math.Rand(-300, 300)
+			))
+		end
+
+		shard:Ignite(SHARD_LIFE, 0)
+		timer.Simple(SHARD_LIFE, function()
+			if IsValid(shard) then shard:Remove() end
+		end)
+	end
+end
+
+function ENT:SetDestroyed()
+	if self.Destroyed then return end
+	self.Destroyed = true
+	self:SetNWBool("Destroyed", true)
+	self.DestroyedTime = CurTime()
+
+	if IsValid(self.PhysObj) then
+		self.TumbleAngVel = self.PhysObj:GetAngleVelocity() + Vector(
+			math.Rand(-180, 180),
+			math.Rand(-180, 180),
+			math.Rand(-180, 180)
+		)
+		self.PhysObj:EnableGravity(true)
+		self.PhysObj:AddAngleVelocity(self.TumbleAngVel)
+	end
+
+	self:Ignite(25, 0)
+	self:SpawnDebrisShards()
+
+	self:FadeAndStopSounds(2.0)
+
+	local altAboveGround = self:GetPos().z - (self.sky - self.SkyHeightAdd)
+	local delay = math.Clamp(altAboveGround / 500, 4, 18)
+	self.ExplodeTimer = CurTime() + delay
+
+	self:Debug("DESTROYED -- crash in " .. math.Round(delay,1) .. "s")
 end
 
 -- ============================================================
@@ -190,56 +276,18 @@ end
 -- ============================================================
 
 function ENT:OnTakeDamage(dmginfo)
-    if self.IsDestroyed then return end
-    if dmginfo:IsDamageType(DMG_CRUSH) then return end
+	if self.ExplodedAlready then return end
+	if dmginfo:IsDamageType(DMG_CRUSH) then return end
 
-    local hp = self:GetNWInt("HP", self.MaxHP or 8000)
-    hp = hp - dmginfo:GetDamage()
-    self:SetNWInt("HP", hp)
-    self:Debug("Hit! HP remaining: " .. tostring(hp))
+	local hp = self:GetNWInt("HP", self.MaxHP or 8000)
+	hp = hp - dmginfo:GetDamage()
+	self:SetNWInt("HP", hp)
+	self:Debug("Hit! HP remaining: " .. tostring(hp))
 
-    if hp <= 0 then
-        self:Debug("Shot down!")
-        self:DestroyPlane()
-    end
-end
-
-function ENT:DestroyPlane()
-    if self.IsDestroyed then return end
-    self.IsDestroyed = true
-
-    -- Fade sounds out over 0.5s; Remove() fires immediately after so
-    -- the timer captures the handles before they are nilled.
-    self:FadeAndStopSounds(0.5)
-
-    local pos = self:GetPos()
-
-    local ed1 = EffectData()
-    ed1:SetOrigin(pos)
-    ed1:SetScale(6) ed1:SetMagnitude(6) ed1:SetRadius(600)
-    util.Effect("HelicopterMegaBomb", ed1, true, true)
-
-    local ed2 = EffectData()
-    ed2:SetOrigin(pos)
-    ed2:SetScale(5) ed2:SetMagnitude(5) ed2:SetRadius(500)
-    util.Effect("500lb_air", ed2, true, true)
-
-    local ed3 = EffectData()
-    ed3:SetOrigin(pos + Vector(0, 0, 80))
-    ed3:SetScale(4) ed3:SetMagnitude(4) ed3:SetRadius(400)
-    util.Effect("500lb_air", ed3, true, true)
-
-    local ed4 = EffectData()
-    ed4:SetOrigin(pos + Vector(0, 0, 180))
-    ed4:SetScale(3) ed4:SetMagnitude(3) ed4:SetRadius(300)
-    util.Effect("500lb_air", ed4, true, true)
-
-    sound.Play("ambient/explosions/explode_8.wav", pos, 140, 90, 1.0)
-    sound.Play("weapon_AWP.Single",               pos, 145, 60, 1.0)
-
-    util.BlastDamage(self, self, pos, 400, 200)
-
-    self:Remove()
+	if hp <= 0 and not self:IsDestroyed() then
+		self:Debug("Shot down!")
+		self:SetDestroyed()
+	end
 end
 
 -- ============================================================
@@ -247,129 +295,204 @@ end
 -- ============================================================
 
 function ENT:Think()
-    if not self.DieTime or not self.SpawnTime then
-        self:NextThink(CurTime() + 0.1)
-        return true
-    end
+	if not self.DieTime or not self.SpawnTime then
+		self:NextThink(CurTime() + 0.1)
+		return true
+	end
 
-    local ct = CurTime()
+	local ct = CurTime()
+	if ct >= self.DieTime then self:Remove() return end
 
-    if ct >= self.DieTime then
-        self:Remove()
-        return
-    end
+	if not IsValid(self.PhysObj) then
+		self.PhysObj = self:GetPhysicsObject()
+	end
+	if IsValid(self.PhysObj) and self.PhysObj:IsAsleep() then
+		self.PhysObj:Wake()
+	end
 
-    if not IsValid(self.PhysObj) then
-        self.PhysObj = self:GetPhysicsObject()
-    end
-    if IsValid(self.PhysObj) and self.PhysObj:IsAsleep() then
-        self.PhysObj:Wake()
-    end
+	-- NPC alert pulse (skip when destroyed)
+	if not self:IsDestroyed() and ct >= self.NextAlertTime then
+		local npcs = ents.FindByClass("npc_*")
+		local plys = player.GetAll()
+		for _, npc in ipairs(npcs) do
+			if not IsValid(npc) then continue end
+			for _, ply in ipairs(plys) do
+				if IsValid(ply) and ply:Alive() then
+					npc:UpdateEnemyMemory(ply, ply:GetPos())
+				end
+			end
+		end
+		self.NextAlertTime = ct + self.AlertInterval
+	end
 
-    -- NPC alert pulse
-    if ct >= self.NextAlertTime then
-        local npcs = ents.FindByClass("npc_*")
-        local plys = player.GetAll()
-        for _, npc in ipairs(npcs) do
-            if not IsValid(npc) then continue end
-            for _, ply in ipairs(plys) do
-                if IsValid(ply) and ply:Alive() then
-                    npc:UpdateEnemyMemory(ply, ply:GetPos())
-                end
-            end
-        end
-        self.NextAlertTime = ct + self.AlertInterval
-    end
+	-- Fade in/out (skip when destroyed)
+	if not self:IsDestroyed() then
+		local age  = ct - self.SpawnTime
+		local left = self.DieTime - ct
+		local alpha = 255
+		if age < self.FadeDuration then
+			alpha = math.Clamp(255 * (age  / self.FadeDuration), 0, 255)
+		elseif left < self.FadeDuration then
+			alpha = math.Clamp(255 * (left / self.FadeDuration), 0, 255)
+		end
+		self:SetColor(Color(255, 255, 255, math.Round(alpha)))
+	end
 
-    -- Fade in / out
-    local alpha = 255
-    local age   = ct - self.SpawnTime
-    local left  = self.DieTime - ct
+	if self:IsDestroyed() then
+		if self.ExplodeTimer and ct >= self.ExplodeTimer then
+			self:CrashExplode(self:GetPos())
+			return true
+		end
+		self:NextThink(ct + 0.05)
+		return true
+	end
 
-    if age < self.FadeDuration then
-        alpha = math.Clamp(255 * (age  / self.FadeDuration), 0, 255)
-    elseif left < self.FadeDuration then
-        alpha = math.Clamp(255 * (left / self.FadeDuration), 0, 255)
-    end
-    self:SetColor(Color(255, 255, 255, math.Round(alpha)))
-
-    self:NextThink(ct)
-    return true
+	self:NextThink(ct)
+	return true
 end
 
 -- ============================================================
--- FLIGHT / ORBIT  (Foxbat-style kinematic)
+-- FLIGHT / POLAR ORBIT
 -- ============================================================
 
 function ENT:PhysicsUpdate(phys)
-    if not self.DieTime or not self.sky then return end
-    if CurTime() >= self.DieTime then self:Remove() return end
+	if not self.DieTime or not self.sky then return end
+	if CurTime() >= self.DieTime then self:Remove() return end
 
-    local pos = self:GetPos()
-    local dt  = engine.TickInterval()
+	-- Destroyed: tumble under gravity
+	if self:IsDestroyed() then
+		local dt = FrameTime()
+		if dt <= 0 then dt = 0.01 end
 
-    -- Altitude drift
-    if CurTime() >= self.AltDriftNextPick then
-        self.AltDriftTarget   = self.sky + math.Rand(-self.AltDriftRange, self.AltDriftRange)
-        self.AltDriftNextPick = CurTime() + math.Rand(12, 30)
-    end
-    self.AltDriftCurrent = Lerp(self.AltDriftLerp, self.AltDriftCurrent, self.AltDriftTarget)
+		local angVel = phys:GetAngleVelocity()
+		phys:AddAngleVelocity(angVel * 0.08 * dt * 60)
 
-    self.JitterPhase = self.JitterPhase + 0.02
-    local jitter     = math.sin(self.JitterPhase) * self.JitterAmplitude
-    local liveAlt    = self.AltDriftCurrent + jitter
+		local extraG = -600 * (GRAVITY_MULT - 1) * phys:GetMass()
+		phys:ApplyForceCenter(Vector(0, 0, extraG))
 
-    -- Orbit / sky-wall yaw
-    local flatPos    = Vector(pos.x, pos.y, 0)
-    local flatCenter = Vector(self.CenterPos.x, self.CenterPos.y, 0)
-    local dist       = flatPos:Distance(flatCenter)
+		local pos  = self:GetPos()
+		local vel  = phys:GetVelocity()
+		local next = pos + vel * dt + Vector(0, 0, -24)
+		local tr = util.TraceLine({
+			start  = pos,
+			endpos = next,
+			filter = self,
+			mask   = MASK_SOLID_BRUSHONLY,
+		})
+		if tr.Hit then self:CrashExplode(tr.HitPos) end
+		return
+	end
 
-    local orbitYaw = 0
-    if dist > self.OrbitRadius and (self.TurnDelay or 0) < CurTime() then
-        orbitYaw       = 0.1
-        self.TurnDelay = CurTime() + 0.02
-    end
+	local pos = self:GetPos()
+	local dt  = FrameTime()
+	if dt <= 0 then dt = 0.01 end
 
-    local flightFwd = Angle(0, self.flightYaw, 0):Forward()
-    local trSky     = util.QuickTrace(pos, flightFwd * 3000, self)
-    local skyYaw    = trSky.HitSky and 0.3 or 0
+	-- Center wander
+	self.WanderPhaseX = self.WanderPhaseX + self.WanderRateX
+	self.WanderPhaseY = self.WanderPhaseY + self.WanderRateY
+	self.CenterPos = Vector(
+		self.BaseCenterPos.x + math.sin(self.WanderPhaseX) * self.WanderAmp,
+		self.BaseCenterPos.y + math.sin(self.WanderPhaseY) * self.WanderAmp,
+		self.BaseCenterPos.z
+	)
 
-    local yawDelta = orbitYaw + skyYaw
-    self.flightYaw = self.flightYaw + yawDelta
-    self.ang.y     = self.ang.y     + yawDelta
+	-- Polar orbit angle
+	self.OrbitAngSpeed = (self.Speed / self.OrbitRadius) * self.OrbitDir
+	self.OrbitAngle    = self.OrbitAngle + self.OrbitAngSpeed * dt
 
-    -- Bank / pitch cosmetics
-    local rawYawDelta  = math.NormalizeAngle(self.flightYaw - (self.PrevYaw or self.flightYaw))
-    self.PrevYaw       = self.flightYaw
+	local desiredX = self.CenterPos.x + math.cos(self.OrbitAngle) * self.OrbitRadius
+	local desiredY = self.CenterPos.y + math.sin(self.OrbitAngle) * self.OrbitRadius
 
-    local targetRoll   = math.Clamp(rawYawDelta * -18, -15, 15)
-    local rollLerp     = rawYawDelta ~= 0 and 0.08 or 0.03
-    self.SmoothedRoll  = Lerp(rollLerp, self.SmoothedRoll, targetRoll)
+	local tangentYaw    = math.deg(self.OrbitAngle) + 90 * self.OrbitDir
+	local yawError      = math.NormalizeAngle(tangentYaw - self.ang.y)
+	local yawCorrection = math.Clamp(yawError * 0.08, -0.6, 0.6)
+	self.ang = self.ang + Angle(0, yawCorrection, 0)
 
-    local fwdSpeed     = IsValid(phys) and phys:GetVelocity():Dot(flightFwd) or self.Speed
-    local speedRatio   = math.Clamp(fwdSpeed / self.Speed, 0, 1)
-    local targetPitch  = math.Clamp(speedRatio * 6, -8, 8)
-    self.SmoothedPitch = Lerp(0.02, self.SmoothedPitch, targetPitch)
+	-- Altitude jitter
+	self.JitterPhase  = self.JitterPhase  + self.JitterRate1
+	self.JitterPhase2 = self.JitterPhase2 + self.JitterRate2
+	local jitter = math.sin(self.JitterPhase)  * self.JitterAmp1
+	             + math.sin(self.JitterPhase2) * self.JitterAmp2
 
-    self.ang.p = self.SmoothedPitch
-    self.ang.r = self.SmoothedRoll
+	-- Altitude drift
+	if CurTime() >= self.AltDriftNextPick then
+		self.AltDriftTarget   = self.sky + math.Rand(-self.AltDriftRange, self.AltDriftRange)
+		self.AltDriftNextPick = CurTime() + math.Rand(12, 30)
+	end
+	self.AltDriftCurrent = Lerp(self.AltDriftLerp, self.AltDriftCurrent, self.AltDriftTarget)
+	local liveAlt = self.AltDriftCurrent + jitter
 
-    -- Kinematic move
-    local fwdDir = Angle(0, self.flightYaw, 0):Forward()
-    local newPos = Vector(pos.x, pos.y, liveAlt) + fwdDir * self.Speed * dt
+	-- Lateral correction toward orbit ring
+	local posErr = Vector(desiredX - pos.x, desiredY - pos.y, 0)
+	local vel    = self:GetForward() * self.Speed
+	if posErr:LengthSqr() > 400 then
+		vel = vel + posErr:GetNormalized() * 80
+	end
 
-    self:SetPos(newPos)
-    self:SetAngles(self.ang)
+	self:SetPos(Vector(pos.x, pos.y, liveAlt))
 
-    if IsValid(phys) then
-        phys:SetPos(newPos)
-        phys:SetVelocity(fwdDir * self.Speed)
-    end
+	-- Bank / pitch cosmetics
+	local rawYawDelta = math.NormalizeAngle(self.ang.y - (self.PrevYaw or self.ang.y))
+	self.PrevYaw      = self.ang.y
 
-    if not self:IsInWorld() then
-        self:Debug("Plane moved out of world")
-        self:Remove()
-    end
+	local targetRoll  = math.Clamp(rawYawDelta * -18, -15, 15)
+	local rollLerp    = rawYawDelta ~= 0 and 0.08 or 0.03
+	self.SmoothedRoll = Lerp(rollLerp, self.SmoothedRoll, targetRoll)
+
+	local physVel      = IsValid(phys) and phys:GetVelocity() or Vector(0,0,0)
+	local forwardSpeed = physVel:Dot(self:GetForward())
+	local speedRatio   = math.Clamp(forwardSpeed / self.Speed, 0, 1)
+	local targetPitch  = math.Clamp(speedRatio * 6, -8, 8)
+	self.SmoothedPitch = Lerp(0.02, self.SmoothedPitch, targetPitch)
+
+	self.ang.p = self.SmoothedPitch
+	self.ang.r = self.SmoothedRoll
+	self:SetAngles(self.ang)
+
+	if IsValid(phys) then
+		phys:SetVelocity(vel)
+	end
+
+	if not self:IsInWorld() then
+		self:Debug("Out of world — removing")
+		self:Remove()
+	end
+end
+
+-- ============================================================
+-- CRASH EXPLOSION
+-- ============================================================
+
+function ENT:CrashExplode(pos)
+	if self.ExplodedAlready then return end
+	self.ExplodedAlready = true
+	self:Debug("CRASH: exploding at " .. tostring(pos))
+
+	local ed1 = EffectData()
+	ed1:SetOrigin(pos)
+	ed1:SetScale(6) ed1:SetMagnitude(6) ed1:SetRadius(600)
+	util.Effect("HelicopterMegaBomb", ed1, true, true)
+
+	local ed2 = EffectData()
+	ed2:SetOrigin(pos)
+	ed2:SetScale(5) ed2:SetMagnitude(5) ed2:SetRadius(500)
+	util.Effect("500lb_air", ed2, true, true)
+
+	local ed3 = EffectData()
+	ed3:SetOrigin(pos + Vector(0, 0, 80))
+	ed3:SetScale(4) ed3:SetMagnitude(4) ed3:SetRadius(400)
+	util.Effect("500lb_air", ed3, true, true)
+
+	local ed4 = EffectData()
+	ed4:SetOrigin(pos + Vector(0, 0, 180))
+	ed4:SetScale(3) ed4:SetMagnitude(3) ed4:SetRadius(300)
+	util.Effect("500lb_air", ed4, true, true)
+
+	sound.Play("ambient/explosions/explode_8.wav", pos, 140, 90, 1.0)
+	sound.Play("weapon_AWP.Single",               pos, 145, 60, 1.0)
+
+	util.BlastDamage(self, self, pos, 400, 200)
+	self:Remove()
 end
 
 -- ============================================================
@@ -377,10 +500,8 @@ end
 -- ============================================================
 
 function ENT:OnRemove()
-    -- Hard-stop synchronously — no timer needed here because OnRemove
-    -- fires while the entity (and its CSoundPatch handles) are still valid.
-    self:StopAllSounds()
-    hook.Remove("OnEntityCreated", "an71_relationship_hook_" .. self:EntIndex())
+	self:StopAllSounds()
+	hook.Remove("OnEntityCreated", "an71_relationship_hook_" .. self:EntIndex())
 end
 
 -- ============================================================
@@ -388,22 +509,20 @@ end
 -- ============================================================
 
 function ENT:FindGround(centerPos)
-    local startPos   = Vector(centerPos.x, centerPos.y, centerPos.z + 64)
-    local endPos     = Vector(centerPos.x, centerPos.y, -16384)
-    local filterList = { self }
-    local trace      = { start = startPos, endpos = endPos, filter = filterList }
-    local maxNumber  = 0
+	local startPos   = Vector(centerPos.x, centerPos.y, centerPos.z + 64)
+	local endPos     = Vector(centerPos.x, centerPos.y, -16384)
+	local filterList = { self }
+	local maxIter    = 0
 
-    while maxNumber < 100 do
-        local tr = util.TraceLine(trace)
-        if tr.HitWorld then return tr.HitPos.z end
-        if IsValid(tr.Entity) then
-            table.insert(filterList, tr.Entity)
-        else
-            break
-        end
-        maxNumber = maxNumber + 1
-    end
-
-    return -1
+	while maxIter < 100 do
+		local tr = util.TraceLine({ start = startPos, endpos = endPos, filter = filterList })
+		if tr.HitWorld then return tr.HitPos.z end
+		if IsValid(tr.Entity) then
+			table.insert(filterList, tr.Entity)
+		else
+			break
+		end
+		maxIter = maxIter + 1
+	end
+	return -1
 end
