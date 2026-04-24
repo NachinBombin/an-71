@@ -7,9 +7,8 @@ local PASS_SOUND_B = "jet/luxor/external.wav"
 local SHARD_MODEL  = "models/props_c17/FurnitureDrawer001a_Shard01.mdl"
 local SHARD_LIFE   = 8
 local GRAVITY_MULT = 1.5
--- +180 offset applied everywhere a tangent yaw is derived from OrbitAngle.
--- This permanently flips the model to face forward without the correction
--- loop ever fighting it back.
+-- +180 offset so the AN-71 model faces forward without the yaw-correction
+-- loop fighting it back every frame.
 local MODEL_YAW_OFFSET = 180
 
 function ENT:Debug(msg)
@@ -94,7 +93,7 @@ function ENT:Initialize()
 		end
 	end)
 
-	-- Polar orbit setup
+	-- Polar orbit setup (identical to SCALP)
 	local baseRadius = self:GetVar("OrbitRadius", 3000)
 	local baseSpeed  = self:GetVar("Speed",        300)
 	self.OrbitRadius = baseRadius * math.Rand(0.82, 1.18)
@@ -133,9 +132,7 @@ function ENT:Initialize()
 	self:SetNWBool("Destroyed", false)
 
 	-- Tangent yaw + MODEL_YAW_OFFSET so the model faces forward from frame 1.
-	-- PhysicsUpdate uses the same offset when computing tangentYaw, so the
-	-- yaw-correction loop always targets the same orientation and never fights
-	-- the flip back.
+	-- PhysicsUpdate uses the same offset when computing tangentYaw.
 	local tangent  = Vector(-entryOffset.y, entryOffset.x, 0) * self.OrbitDir
 	local startAng = tangent:Angle()
 	self.ang = Angle(0, startAng.y + MODEL_YAW_OFFSET, 0)
@@ -145,6 +142,7 @@ function ENT:Initialize()
 	self.SmoothedPitch = 0
 	self.PrevYaw       = self.ang.y
 
+	-- Altitude jitter (same params as SCALP)
 	self.JitterPhase  = math.Rand(0, math.pi * 2)
 	self.JitterPhase2 = math.Rand(0, math.pi * 2)
 	self.JitterAmp1   = math.Rand(8,  18)
@@ -152,10 +150,14 @@ function ENT:Initialize()
 	self.JitterRate1  = math.Rand(0.030, 0.060)
 	self.JitterRate2  = math.Rand(0.007, 0.015)
 
+	-- Altitude drift (same params as SCALP)
 	self.AltDriftCurrent  = self.sky
 	self.AltDriftTarget   = self.sky
-	self.AltDriftNextPick = CurTime() + math.Rand(12, 30)
+	self.AltDriftNextPick = CurTime() + math.Rand(8, 20)
+	self.AltDriftRange    = 700
+	self.AltDriftLerp     = 0.003
 
+	-- Center wander
 	self.BaseCenterPos = Vector(self.CenterPos.x, self.CenterPos.y, self.CenterPos.z)
 	self.WanderPhaseX  = math.Rand(0, math.pi * 2)
 	self.WanderPhaseY  = math.Rand(0, math.pi * 2)
@@ -169,10 +171,10 @@ function ENT:Initialize()
 		self.PhysObj:EnableGravity(false)
 	end
 
-	-- Death tumble state
+	-- Death tumble state (identical to SCALP)
 	self.Destroyed       = false
 	self.DestroyedTime   = nil
-	self.TumbleAngVel    = Vector(0,0,0)
+	self.TumbleAngVel    = Vector(0, 0, 0)
 	self.ExplodeTimer    = nil
 	self.ExplodedAlready = false
 
@@ -235,7 +237,7 @@ function ENT:SpawnDebrisShards()
 			phys:SetVelocity(baseVel * 0.3 + Vector(
 				math.Rand(-400, 400),
 				math.Rand(-400, 400),
-				math.Rand(100, 350)
+				math.Rand(100,  350)
 			))
 			phys:AddAngleVelocity(Vector(
 				math.Rand(-300, 300),
@@ -251,6 +253,8 @@ function ENT:SpawnDebrisShards()
 	end
 end
 
+-- SCALP tumble: seed TumbleAngVel from existing physobj angvel + random kick,
+-- enable real gravity, then PhysicsUpdate amplifies the seeded spin each frame.
 function ENT:SetDestroyed()
 	if self.Destroyed then return end
 	self.Destroyed = true
@@ -258,11 +262,13 @@ function ENT:SetDestroyed()
 	self.DestroyedTime = CurTime()
 
 	if IsValid(self.PhysObj) then
-		self.TumbleAngVel = self.PhysObj:GetAngleVelocity() + Vector(
-			math.Rand(-180, 180),
-			math.Rand(-180, 180),
-			math.Rand(-180, 180)
+		local existing = self.PhysObj:GetAngleVelocity()
+		self.TumbleAngVel = existing + Vector(
+			math.Rand(-120, 120),
+			math.Rand(-120, 120),
+			math.Rand(-120, 120)
 		)
+		-- Real gravity on; PhysicsUpdate adds only the EXTRA delta on top.
 		self.PhysObj:EnableGravity(true)
 		self.PhysObj:AddAngleVelocity(self.TumbleAngVel)
 	end
@@ -271,9 +277,8 @@ function ENT:SetDestroyed()
 	self:SpawnDebrisShards()
 	self:FadeAndStopSounds(2.0)
 
-	-- Crash delay: altitude above ground / 1200, clamped 1.5–3s
 	local altAboveGround = self:GetPos().z - (self.sky - self.SkyHeightAdd)
-	local delay = math.Clamp(altAboveGround / 1200, 1.5, 3)
+	local delay = math.Clamp(altAboveGround / 600, 3, 12)
 	self.ExplodeTimer = CurTime() + delay
 
 	self:Debug("DESTROYED -- crash in " .. math.Round(delay,1) .. "s")
@@ -360,24 +365,30 @@ function ENT:Think()
 end
 
 -- ============================================================
--- FLIGHT / POLAR ORBIT
+-- PHYSICS UPDATE  (SCALP orbit + SCALP tumble)
 -- ============================================================
 
 function ENT:PhysicsUpdate(phys)
 	if not self.DieTime or not self.sky then return end
 	if CurTime() >= self.DieTime then self:Remove() return end
 
-	-- Destroyed: tumble under gravity
+	-- ---- Destroyed: SCALP tumble ----
 	if self:IsDestroyed() then
 		local dt = FrameTime()
 		if dt <= 0 then dt = 0.01 end
 
+		-- Self-reinforcing spin: amplify whatever is already spinning.
+		-- Works because SetDestroyed seeded a meaningful TumbleAngVel via
+		-- PhysObj:AddAngleVelocity before gravity was re-enabled.
 		local angVel = phys:GetAngleVelocity()
 		phys:AddAngleVelocity(angVel * 0.08 * dt * 60)
 
+		-- Real gravity is already on. Add only the EXTRA delta so the fall
+		-- is punchier without stripping the horizontal arc.
 		local extraG = -600 * (GRAVITY_MULT - 1) * phys:GetMass()
 		phys:ApplyForceCenter(Vector(0, 0, extraG))
 
+		-- Ground-hit detection
 		local pos  = self:GetPos()
 		local vel  = phys:GetVelocity()
 		local next = pos + vel * dt + Vector(0, 0, -24)
@@ -391,6 +402,7 @@ function ENT:PhysicsUpdate(phys)
 		return
 	end
 
+	-- ---- Normal orbit (SCALP) ----
 	local pos = self:GetPos()
 	local dt  = FrameTime()
 	if dt <= 0 then dt = 0.01 end
@@ -404,19 +416,18 @@ function ENT:PhysicsUpdate(phys)
 		self.BaseCenterPos.z
 	)
 
-	-- Polar orbit angle advance
+	-- Orbit angle advance
 	self.OrbitAngSpeed = (self.Speed / self.OrbitRadius) * self.OrbitDir
 	self.OrbitAngle    = self.OrbitAngle + self.OrbitAngSpeed * dt
 
 	local desiredX = self.CenterPos.x + math.cos(self.OrbitAngle) * self.OrbitRadius
 	local desiredY = self.CenterPos.y + math.sin(self.OrbitAngle) * self.OrbitRadius
 
-	-- tangentYaw includes MODEL_YAW_OFFSET so the correction loop always
-	-- targets the flipped orientation and never fights the spawn flip.
+	-- tangentYaw includes MODEL_YAW_OFFSET so correction never fights the spawn flip.
 	local tangentYaw    = math.deg(self.OrbitAngle) + 90 * self.OrbitDir + MODEL_YAW_OFFSET
 	local yawError      = math.NormalizeAngle(tangentYaw - self.ang.y)
 	local yawCorrection = math.Clamp(yawError * 0.08, -0.6, 0.6)
-	self.ang = self.ang + Angle(0, yawCorrection, 0)
+	self.ang            = self.ang + Angle(0, yawCorrection, 0)
 
 	-- Altitude jitter
 	self.JitterPhase  = self.JitterPhase  + self.JitterRate1
@@ -427,7 +438,7 @@ function ENT:PhysicsUpdate(phys)
 	-- Altitude drift
 	if CurTime() >= self.AltDriftNextPick then
 		self.AltDriftTarget   = self.sky + math.Rand(-self.AltDriftRange, self.AltDriftRange)
-		self.AltDriftNextPick = CurTime() + math.Rand(12, 30)
+		self.AltDriftNextPick = CurTime() + math.Rand(10, 25)
 	end
 	self.AltDriftCurrent = Lerp(self.AltDriftLerp, self.AltDriftCurrent, self.AltDriftTarget)
 	local liveAlt = self.AltDriftCurrent + jitter
@@ -441,19 +452,19 @@ function ENT:PhysicsUpdate(phys)
 
 	self:SetPos(Vector(pos.x, pos.y, liveAlt))
 
-	-- Bank / pitch cosmetics
+	-- Bank / pitch cosmetics (SCALP values)
 	local rawYawDelta = math.NormalizeAngle(self.ang.y - (self.PrevYaw or self.ang.y))
 	self.PrevYaw      = self.ang.y
 
-	local targetRoll  = math.Clamp(rawYawDelta * -18, -15, 15)
-	local rollLerp    = rawYawDelta ~= 0 and 0.08 or 0.03
+	local targetRoll  = math.Clamp(rawYawDelta * -25, -30, 30)
+	local rollLerp    = rawYawDelta ~= 0 and 0.15 or 0.05
 	self.SmoothedRoll = Lerp(rollLerp, self.SmoothedRoll, targetRoll)
 
-	local physVel      = IsValid(phys) and phys:GetVelocity() or Vector(0,0,0)
+	local physVel      = IsValid(phys) and phys:GetVelocity() or Vector(0, 0, 0)
 	local forwardSpeed = physVel:Dot(self:GetForward())
 	local speedRatio   = math.Clamp(forwardSpeed / self.Speed, 0, 1)
-	local targetPitch  = math.Clamp(speedRatio * 6, -8, 8)
-	self.SmoothedPitch = Lerp(0.02, self.SmoothedPitch, targetPitch)
+	local targetPitch  = math.Clamp(speedRatio * 10, -15, 15)
+	self.SmoothedPitch = Lerp(0.04, self.SmoothedPitch, targetPitch)
 
 	self.ang.p = self.SmoothedPitch
 	self.ang.r = self.SmoothedRoll
