@@ -25,20 +25,12 @@ end
 -- SOUND HELPERS
 -- ============================================================
 
--- Hard-stop all sounds immediately. Safe to call from OnRemove
--- because CreateSound(self) handles are still valid at that point.
 function ENT:StopAllSounds()
     if self.EngineLoop then self.EngineLoop:Stop() self.EngineLoop = nil end
     if self.PassSoundA then self.PassSoundA:Stop() self.PassSoundA = nil end
     if self.PassSoundB then self.PassSoundB:Stop() self.PassSoundB = nil end
 end
 
--- Fade out then stop. Used when the plane is destroyed or despawns
--- naturally so sounds tail off rather than cut abruptly.
--- NOTE: timer.Simple is safe here because Remove() is called AFTER
--- this function returns, and the CSoundPatch handle (attached to
--- game.GetWorld for the purpose of the timer capture) will still
--- be valid when the timer fires.
 function ENT:FadeAndStopSounds(fadeTime)
     local t = fadeTime or 0.5
     local e = self.EngineLoop
@@ -58,6 +50,11 @@ function ENT:FadeAndStopSounds(fadeTime)
         if b then b:Stop() end
     end)
 end
+
+-- ============================================================
+-- NET STRING
+-- ============================================================
+util.AddNetworkString("bombin_plane_damage_tier")
 
 -- ============================================================
 -- INITIALIZE
@@ -91,6 +88,7 @@ function ENT:Initialize()
     self.SpawnTime     = CurTime()
     self.NextAlertTime = CurTime()
     self.IsDestroyed   = false
+    self.DamageTier    = 0
 
     for _, ent in ipairs(ents.GetAll()) do
         if IsValid(ent) and ent:IsNPC() then
@@ -126,7 +124,7 @@ function ENT:Initialize()
     self:SetCollisionGroup(COLLISION_GROUP_INTERACTIVE_DEBRIS)
     self:SetPos(spawnPos)
 
-    self:SetBodygroup(0, 1) -- retract landing gear
+    self:SetBodygroup(0, 1)
 
     self:SetRenderMode(RENDERMODE_TRANSALPHA)
     self:SetColor(Color(255, 255, 255, 0))
@@ -153,11 +151,6 @@ function ENT:Initialize()
         self.PhysObj:SetAngles(self.ang)
     end
 
-    -- ── Sounds ─────────────────────────────────────────────────────────
-    -- CreateSound(self, ...) attaches the CSoundPatch to this entity so
-    -- the audio is positional and follows the plane as it moves.
-    -- We keep explicit handles so we can Stop() them cleanly; this avoids
-    -- the leak that EmitSound() causes with long looping files.
     self.EngineLoop = CreateSound(self, self.EngineSound)
     if self.EngineLoop then
         self.EngineLoop:SetSoundLevel(80)
@@ -182,7 +175,27 @@ function ENT:Initialize()
         self.PassSoundB:Play()
     end
 
-    self:Debug("Spawned at " .. tostring(spawnPos) .. " flightYaw=" .. tostring(self.flightYaw) .. " visualYaw=" .. tostring(self.ang.y))
+    self:Debug("Spawned at " .. tostring(spawnPos))
+end
+
+-- ============================================================
+-- DAMAGE TIER HELPER
+-- ============================================================
+
+local function CalcTier(hp, maxHP)
+    local frac = hp / maxHP
+    if frac > 0.66 then return 0
+    elseif frac > 0.33 then return 1
+    elseif frac > 0 then return 2
+    else return 3
+    end
+end
+
+local function BroadcastTier(ent, tier)
+    net.Start("bombin_plane_damage_tier")
+        net.WriteUInt(ent:EntIndex(), 16)
+        net.WriteUInt(tier, 2)
+    net.Broadcast()
 end
 
 -- ============================================================
@@ -198,6 +211,12 @@ function ENT:OnTakeDamage(dmginfo)
     self:SetNWInt("HP", hp)
     self:Debug("Hit! HP remaining: " .. tostring(hp))
 
+    local tier = CalcTier(hp, self.MaxHP or 8000)
+    if tier ~= self.DamageTier then
+        self.DamageTier = tier
+        BroadcastTier(self, tier)
+    end
+
     if hp <= 0 then
         self:Debug("Shot down!")
         self:DestroyPlane()
@@ -208,8 +227,6 @@ function ENT:DestroyPlane()
     if self.IsDestroyed then return end
     self.IsDestroyed = true
 
-    -- Fade sounds out over 0.5s; Remove() fires immediately after so
-    -- the timer captures the handles before they are nilled.
     self:FadeAndStopSounds(0.5)
 
     local pos = self:GetPos()
@@ -266,7 +283,6 @@ function ENT:Think()
         self.PhysObj:Wake()
     end
 
-    -- NPC alert pulse
     if ct >= self.NextAlertTime then
         local npcs = ents.FindByClass("npc_*")
         local plys = player.GetAll()
@@ -281,7 +297,6 @@ function ENT:Think()
         self.NextAlertTime = ct + self.AlertInterval
     end
 
-    -- Fade in / out
     local alpha = 255
     local age   = ct - self.SpawnTime
     local left  = self.DieTime - ct
@@ -298,7 +313,7 @@ function ENT:Think()
 end
 
 -- ============================================================
--- FLIGHT / ORBIT  (Foxbat-style kinematic)
+-- FLIGHT / ORBIT
 -- ============================================================
 
 function ENT:PhysicsUpdate(phys)
@@ -308,7 +323,6 @@ function ENT:PhysicsUpdate(phys)
     local pos = self:GetPos()
     local dt  = engine.TickInterval()
 
-    -- Altitude drift
     if CurTime() >= self.AltDriftNextPick then
         self.AltDriftTarget   = self.sky + math.Rand(-self.AltDriftRange, self.AltDriftRange)
         self.AltDriftNextPick = CurTime() + math.Rand(12, 30)
@@ -319,7 +333,6 @@ function ENT:PhysicsUpdate(phys)
     local jitter     = math.sin(self.JitterPhase) * self.JitterAmplitude
     local liveAlt    = self.AltDriftCurrent + jitter
 
-    -- Orbit / sky-wall yaw
     local flatPos    = Vector(pos.x, pos.y, 0)
     local flatCenter = Vector(self.CenterPos.x, self.CenterPos.y, 0)
     local dist       = flatPos:Distance(flatCenter)
@@ -338,7 +351,6 @@ function ENT:PhysicsUpdate(phys)
     self.flightYaw = self.flightYaw + yawDelta
     self.ang.y     = self.ang.y     + yawDelta
 
-    -- Bank / pitch cosmetics
     local rawYawDelta  = math.NormalizeAngle(self.flightYaw - (self.PrevYaw or self.flightYaw))
     self.PrevYaw       = self.flightYaw
 
@@ -354,7 +366,6 @@ function ENT:PhysicsUpdate(phys)
     self.ang.p = self.SmoothedPitch
     self.ang.r = self.SmoothedRoll
 
-    -- Kinematic move
     local fwdDir = Angle(0, self.flightYaw, 0):Forward()
     local newPos = Vector(pos.x, pos.y, liveAlt) + fwdDir * self.Speed * dt
 
@@ -377,8 +388,6 @@ end
 -- ============================================================
 
 function ENT:OnRemove()
-    -- Hard-stop synchronously — no timer needed here because OnRemove
-    -- fires while the entity (and its CSoundPatch handles) are still valid.
     self:StopAllSounds()
     hook.Remove("OnEntityCreated", "an71_relationship_hook_" .. self:EntIndex())
 end
