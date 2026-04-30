@@ -91,6 +91,12 @@ function ENT:Initialize()
     self.IsDestroyed   = false
     self.DamageTier    = 0
 
+    -- Tumble state
+    self.IsTumbling      = false
+    self.TumbleStartTime = 0
+    self.TumbleGroundZ   = ground
+    self.TumbleCrashed   = false
+
     for _, ent in ipairs(ents.GetAll()) do
         if IsValid(ent) and ent:IsNPC() then
             SeedRelationship(ent)
@@ -224,11 +230,58 @@ function ENT:OnTakeDamage(dmginfo)
     end
 end
 
-function ENT:DestroyPlane()
-    if self.IsDestroyed then return end
-    self.IsDestroyed = true
+-- ============================================================
+-- TUMBLE SYSTEM
+-- ============================================================
 
-    self:FadeAndStopSounds(0.5)
+-- Called once when HP hits 0.  Kicks the plane out of controlled flight
+-- and into a physics-driven dive+tumble that ends with CrashExplode().
+function ENT:StartTumble()
+    self.IsTumbling      = true
+    self.TumbleStartTime = CurTime()
+    self.TumbleCrashed   = false
+
+    -- Refresh ground reference from the current position
+    local gnd = self:FindGround(self:GetPos())
+    if gnd ~= -1 then self.TumbleGroundZ = gnd end
+
+    local phys = self:GetPhysicsObject()
+    if IsValid(phys) then
+        -- Re-enable gravity so the plane falls under its own weight
+        phys:EnableGravity(true)
+        phys:Wake()
+
+        -- Combine forward momentum with a strong nose-down component.
+        -- This is the "dive" behaviour the autonomous-craft logic requires:
+        -- the wreck travels forward and downward rather than dropping straight.
+        local fwd    = self:GetForward()
+        local speed  = self.Speed or 300
+        local diveVel = fwd * speed + Vector(0, 0, -600)
+        phys:SetVelocity(diveVel)
+
+        -- Heavy roll spin with random signs so every crash looks different
+        local sign = function() return (math.random(2) == 1) and 1 or -1 end
+        local tumbleSpin = Vector(
+            math.Rand(80,  200) * sign(),   -- pitch
+            math.Rand(20,  80)  * sign(),   -- yaw
+            math.Rand(150, 400) * sign()    -- roll (dominant axis)
+        )
+        phys:SetAngleVelocity(tumbleSpin)
+    end
+
+    -- Initial hit burst
+    local pos = self:GetPos()
+    local ed = EffectData()
+    ed:SetOrigin(pos)
+    ed:SetScale(4) ed:SetMagnitude(4) ed:SetRadius(400)
+    util.Effect("500lb_air", ed, true, true)
+    sound.Play("ambient/explosions/explode_4.wav", pos, 135, 95, 1.0)
+end
+
+-- Detonates the wreck on ground contact and removes the entity.
+function ENT:CrashExplode()
+    if self.TumbleCrashed then return end
+    self.TumbleCrashed = true
 
     local pos = self:GetPos()
 
@@ -260,6 +313,23 @@ function ENT:DestroyPlane()
     self:Remove()
 end
 
+function ENT:DestroyPlane()
+    if self.IsDestroyed then return end
+    self.IsDestroyed = true
+
+    self:FadeAndStopSounds(0.3)
+
+    -- Hand off to the tumble system instead of instant removal
+    self:StartTumble()
+
+    -- Safety net: if the crash detector somehow never fires, force-remove
+    timer.Simple(12, function()
+        if IsValid(self) then
+            self:CrashExplode()
+        end
+    end)
+end
+
 -- ============================================================
 -- THINK
 -- ============================================================
@@ -271,6 +341,32 @@ function ENT:Think()
     end
 
     local ct = CurTime()
+
+    -- Tumble altitude monitor (runs at 20 Hz to stay responsive)
+    if self.IsTumbling and not self.TumbleCrashed then
+        local pos     = self:GetPos()
+        local groundZ = self.TumbleGroundZ or -16384
+
+        -- Direct altitude check
+        if pos.z <= groundZ + 150 then
+            self:CrashExplode()
+            return
+        end
+
+        -- Short downward trace to catch sloped terrain or geometry above groundZ
+        local tr = util.TraceLine({
+            start  = pos,
+            endpos = pos + Vector(0, 0, -200),
+            filter = self,
+        })
+        if tr.HitWorld then
+            self:CrashExplode()
+            return
+        end
+
+        self:NextThink(ct + 0.05)
+        return true
+    end
 
     if ct >= self.DieTime then
         self:Remove()
@@ -314,11 +410,24 @@ function ENT:Think()
 end
 
 -- ============================================================
--- FLIGHT / ORBIT
+-- PHYSICS UPDATE  (flight steering + tumble drag)
 -- ============================================================
 
 function ENT:PhysicsUpdate(phys)
     if not self.DieTime or not self.sky then return end
+
+    -- During tumble the physics engine owns the trajectory.
+    -- We only bleed off horizontal speed to simulate aerodynamic drag so the
+    -- wreck arcs forward-and-down (dive) rather than flying level.
+    if self.IsTumbling then
+        if IsValid(phys) and not self.TumbleCrashed then
+            local vel   = phys:GetVelocity()
+            local decay = 0.97   -- gentle per-tick drag on the horizontal plane
+            phys:SetVelocity(Vector(vel.x * decay, vel.y * decay, vel.z))
+        end
+        return  -- no steering during tumble
+    end
+
     if CurTime() >= self.DieTime then self:Remove() return end
 
     local pos = self:GetPos()
