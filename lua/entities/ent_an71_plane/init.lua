@@ -105,42 +105,18 @@ function ENT:Initialize()
     self.TumbleAngVelocity = Vector(0, 0, 0)
 
     -- Orbit state — fully randomised per spawn
-    self.OrbitNormal = VectorRand()
-    self.OrbitNormal.z = math.Rand(-0.25, 0.25)
-    if self.OrbitNormal:LengthSqr() < 0.001 then
-        self.OrbitNormal = Vector(0, 0, 1)
-    end
-    self.OrbitNormal:Normalize()
-
-    local outward = VectorRand()
-    outward.z = math.Rand(-0.08, 0.08)
-    if outward:LengthSqr() < 0.001 then
-        outward = self.CallDir * -1
-    end
-    outward:Normalize()
-
-    local tangent = self.OrbitNormal:Cross(outward)
-    if tangent:LengthSqr() < 0.001 then
-        tangent = self.CallDir
-    end
-    tangent.z = 0
-    if tangent:LengthSqr() < 0.001 then
-        tangent = Vector(1, 0, 0)
-    end
-    tangent:Normalize()
-
-    if tangent:Dot(self.CallDir) < 0 then
-        tangent = -tangent
-    end
-
     self.OrbitDirection = (math.random(2) == 1) and 1 or -1
-    self.OrbitTangent   = tangent * self.OrbitDirection
-    self.OrbitPhase     = math.Rand(0, math.pi * 2)
-    self.OrbitNoiseSeed = math.Rand(0, 1000)
     self.OrbitBlend     = 0.08
     self.RadialGain     = 0.42
     self.SkyAvoidGain   = 0.65
     self.MaxTurnRate    = 32
+
+    -- Compute a tangent that roughly aligns with CallDir
+    local right = Vector(-self.CallDir.y, self.CallDir.x, 0)
+    local tangent = self.CallDir * math.cos(0) + right * math.sin(0)
+    tangent.z = 0
+    tangent:Normalize()
+    self.OrbitTangent = tangent * self.OrbitDirection
 
     for _, ent in ipairs(ents.GetAll()) do
         if IsValid(ent) and ent:IsNPC() then
@@ -191,7 +167,10 @@ function ENT:Initialize()
     self.AltDriftCurrent  = self.sky
     self.AltDriftTarget   = self.sky
     self.AltDriftNextPick = CurTime() + math.Rand(12, 30)
+    self.AltDriftRange    = self.AltDriftRange or 300
+    self.AltDriftLerp     = self.AltDriftLerp  or 0.001
     self.JitterPhase      = math.Rand(0, math.pi * 2)
+    self.JitterAmplitude  = self.JitterAmplitude or 5
     self.SmoothedRoll     = 0
     self.SmoothedPitch    = 0
 
@@ -289,9 +268,6 @@ function ENT:StartTumble()
     local gnd = self:FindGround(self:GetPos())
     if gnd ~= -1 then self.TumbleGroundZ = gnd end
 
-    -- Use flightYaw (the true direction of travel) NOT GetForward().
-    -- self.ang.y = flightYaw + MODEL_YAW_OFFSET (180°), so GetForward()
-    -- points opposite to travel. We reconstruct the real travel vector here.
     local travelFwd = Angle(0, self.flightYaw, 0):Forward()
     local speed     = self.Speed or 300
 
@@ -322,23 +298,19 @@ function ENT:CrashExplode()
 
     local pos = self:GetPos()
 
-    local ed1 = EffectData()
-    ed1:SetOrigin(pos)
+    local ed1 = EffectData() ed1:SetOrigin(pos)
     ed1:SetScale(6) ed1:SetMagnitude(6) ed1:SetRadius(600)
     util.Effect("HelicopterMegaBomb", ed1, true, true)
 
-    local ed2 = EffectData()
-    ed2:SetOrigin(pos)
+    local ed2 = EffectData() ed2:SetOrigin(pos)
     ed2:SetScale(5) ed2:SetMagnitude(5) ed2:SetRadius(500)
     util.Effect("500lb_air", ed2, true, true)
 
-    local ed3 = EffectData()
-    ed3:SetOrigin(pos + Vector(0, 0, 80))
+    local ed3 = EffectData() ed3:SetOrigin(pos + Vector(0, 0, 80))
     ed3:SetScale(4) ed3:SetMagnitude(4) ed3:SetRadius(400)
     util.Effect("500lb_air", ed3, true, true)
 
-    local ed4 = EffectData()
-    ed4:SetOrigin(pos + Vector(0, 0, 180))
+    local ed4 = EffectData() ed4:SetOrigin(pos + Vector(0, 0, 180))
     ed4:SetScale(3) ed4:SetMagnitude(3) ed4:SetRadius(300)
     util.Effect("500lb_air", ed4, true, true)
 
@@ -346,17 +318,14 @@ function ENT:CrashExplode()
     sound.Play("weapon_AWP.Single", pos, 145, 60, 1.0)
 
     util.BlastDamage(self, self, pos, 400, 200)
-
     self:Remove()
 end
 
 function ENT:DestroyPlane()
     if self.IsDestroyed then return end
     self.IsDestroyed = true
-
     self:FadeAndStopSounds(0.3)
     self:StartTumble()
-
     timer.Simple(12, function()
         if IsValid(self) then self:CrashExplode() end
     end)
@@ -377,30 +346,14 @@ function ENT:Think()
     if self.IsTumbling and not self.TumbleCrashed then
         local pos     = self:GetPos()
         local groundZ = self.TumbleGroundZ or -16384
-
-        if pos.z <= groundZ + 150 then
-            self:CrashExplode()
-            return
-        end
-
-        local tr = util.TraceLine({
-            start  = pos,
-            endpos = pos + Vector(0, 0, -200),
-            filter = self,
-        })
-        if tr.HitWorld then
-            self:CrashExplode()
-            return
-        end
-
+        if pos.z <= groundZ + 150 then self:CrashExplode() return end
+        local tr = util.TraceLine({ start = pos, endpos = pos + Vector(0,0,-200), filter = self })
+        if tr.HitWorld then self:CrashExplode() return end
         self:NextThink(ct + 0.05)
         return true
     end
 
-    if ct >= self.DieTime then
-        self:Remove()
-        return
-    end
+    if ct >= self.DieTime then self:Remove() return end
 
     if not IsValid(self.PhysObj) then
         self.PhysObj = self:GetPhysicsObject()
@@ -426,7 +379,6 @@ function ENT:Think()
     local alpha = 255
     local age   = ct - self.SpawnTime
     local left  = self.DieTime - ct
-
     if age < self.FadeDuration then
         alpha = math.Clamp(255 * (age  / self.FadeDuration), 0, 255)
     elseif left < self.FadeDuration then
@@ -445,26 +397,25 @@ end
 function ENT:PhysicsUpdate(phys)
     if not self.DieTime or not self.sky then return end
 
+    -- ---- TUMBLE PATH ----
     if self.IsTumbling then
         if self.TumbleCrashed then return end
 
         local dt      = engine.TickInterval()
         local gravity = physenv.GetGravity().z
-
         self.TumbleVelocity.z = self.TumbleVelocity.z + gravity * dt
 
         local pos    = self:GetPos()
         local newPos = pos + self.TumbleVelocity * dt
 
-        -- Tumble angles spin freely — no MODEL_YAW_OFFSET applied here.
-        -- The offset only matters during normal flight to align the mesh;
-        -- during tumble the plane is out of control so raw spin looks correct.
-        local av  = self.TumbleAngVelocity
-        local newP = self.ang.p + av.x * dt
-        local newY = self.ang.y + av.y * dt
-        local newR = self.ang.r + av.z * dt
-        self.ang = Angle(newP, newY, newR)
+        local av   = self.TumbleAngVelocity
+        self.ang = Angle(
+            self.ang.p + av.x * dt,
+            self.ang.y + av.y * dt,
+            self.ang.r + av.z * dt
+        )
 
+        -- Tumble uses full phys authority: both entity and phys object move together.
         self:SetPos(newPos)
         self:SetAngles(self.ang)
         if IsValid(phys) then
@@ -476,28 +427,34 @@ function ENT:PhysicsUpdate(phys)
 
     if CurTime() >= self.DieTime then self:Remove() return end
 
+    -- ---- NORMAL FLIGHT PATH ----
+    -- Position is integrated here and applied via SetPos/SetAngles ONLY.
+    -- phys:SetPos / phys:SetVelocity are NOT called during normal flight.
+    -- Calling both SetPos and phys:SetVelocity causes the engine to move the
+    -- entity twice per tick (once from SetPos, once from Havok integrating the
+    -- velocity), producing the visible teleport/stutter at speed.
+
     local pos = self:GetPos()
     local dt  = engine.TickInterval()
 
+    -- Altitude drift
     if CurTime() >= self.AltDriftNextPick then
         self.AltDriftTarget   = self.sky + math.Rand(-self.AltDriftRange, self.AltDriftRange)
         self.AltDriftNextPick = CurTime() + math.Rand(12, 30)
     end
     self.AltDriftCurrent = Lerp(self.AltDriftLerp, self.AltDriftCurrent, self.AltDriftTarget)
-
     self.JitterPhase = self.JitterPhase + 0.02
-    local jitter     = math.sin(self.JitterPhase) * self.JitterAmplitude
-    local liveAlt    = self.AltDriftCurrent + jitter
+    local jitter  = math.sin(self.JitterPhase) * self.JitterAmplitude
+    local liveAlt = self.AltDriftCurrent + jitter
 
+    -- Orbit steering
     local flatPos    = Vector(pos.x, pos.y, 0)
     local flatCenter = Vector(self.CenterPos.x, self.CenterPos.y, 0)
     local toCenter   = flatCenter - flatPos
     local dist       = toCenter:Length()
 
     local radialDir = Vector(0, 0, 0)
-    if dist > 1 then
-        radialDir = toCenter / dist
-    end
+    if dist > 1 then radialDir = toCenter / dist end
 
     local tangentDir = Vector(-radialDir.y, radialDir.x, 0) * self.OrbitDirection
     if tangentDir:LengthSqr() <= 0.001 then
@@ -513,22 +470,17 @@ function ENT:PhysicsUpdate(phys)
 
     local desiredDir = tangentDir + radialDir * radialError * self.RadialGain
 
-    local skyProbeDist = math.max(1200, self.Speed * 6)
-    local forwardDir   = Angle(0, self.flightYaw, 0):Forward()
-    local trForward    = util.QuickTrace(pos, forwardDir * skyProbeDist, self)
-    local trLeft       = util.QuickTrace(pos, forwardDir:Angle():Right() * -900 + forwardDir * 600, self)
-    local trRight      = util.QuickTrace(pos, forwardDir:Angle():Right() *  900 + forwardDir * 600, self)
+    -- Sky-wall avoidance using the true travel direction
+    local forwardDir     = Angle(0, self.flightYaw, 0):Forward()
+    local skyProbeDist   = math.max(1200, self.Speed * 6)
+    local trForward      = util.QuickTrace(pos, forwardDir * skyProbeDist, self)
+    local trLeft         = util.QuickTrace(pos, forwardDir:Angle():Right() * -900 + forwardDir * 600, self)
+    local trRight        = util.QuickTrace(pos, forwardDir:Angle():Right() *  900 + forwardDir * 600, self)
 
     local skyAvoid = Vector(0, 0, 0)
-    if trForward.HitSky then
-        skyAvoid = skyAvoid - forwardDir
-    end
-    if trLeft.HitSky then
-        skyAvoid = skyAvoid + forwardDir:Angle():Right()
-    end
-    if trRight.HitSky then
-        skyAvoid = skyAvoid - forwardDir:Angle():Right()
-    end
+    if trForward.HitSky then skyAvoid = skyAvoid - forwardDir end
+    if trLeft.HitSky    then skyAvoid = skyAvoid + forwardDir:Angle():Right() end
+    if trRight.HitSky   then skyAvoid = skyAvoid - forwardDir:Angle():Right() end
     skyAvoid.z = 0
     if skyAvoid:LengthSqr() > 0.001 then
         skyAvoid:Normalize()
@@ -536,81 +488,66 @@ function ENT:PhysicsUpdate(phys)
     end
 
     desiredDir.z = 0
-    if desiredDir:LengthSqr() <= 0.001 then
-        desiredDir = tangentDir
-    end
+    if desiredDir:LengthSqr() <= 0.001 then desiredDir = tangentDir end
     desiredDir:Normalize()
 
     local desiredYaw = desiredDir:Angle().y
     local yawDiff    = math.NormalizeAngle(desiredYaw - self.flightYaw)
     local maxStep    = self.MaxTurnRate * dt
-    local yawStep    = math.Clamp(yawDiff, -maxStep, maxStep)
+    self.flightYaw   = self.flightYaw + math.Clamp(yawDiff, -maxStep, maxStep)
 
-    self.flightYaw = self.flightYaw + yawStep
-
+    -- Roll / pitch smoothing
     local rawYawDelta  = math.NormalizeAngle(self.flightYaw - (self.PrevYaw or self.flightYaw))
     self.PrevYaw       = self.flightYaw
 
-    local targetRoll   = math.Clamp(rawYawDelta * -2.0, -20, 20)
-    local rollLerp     = math.abs(rawYawDelta) > 0.01 and 0.12 or 0.04
-    self.SmoothedRoll  = Lerp(rollLerp, self.SmoothedRoll, targetRoll)
+    local targetRoll  = math.Clamp(rawYawDelta * -2.0, -20, 20)
+    local rollLerp    = math.abs(rawYawDelta) > 0.01 and 0.12 or 0.04
+    self.SmoothedRoll = Lerp(rollLerp, self.SmoothedRoll, targetRoll)
 
-    local fwdDir       = Angle(0, self.flightYaw, 0):Forward()
-    local vel          = IsValid(phys) and phys:GetVelocity() or (fwdDir * self.Speed)
-    local fwdSpeed     = vel:Dot(fwdDir)
-    local speedRatio   = math.Clamp(fwdSpeed / self.Speed, 0, 1.15)
-    local climbDelta   = math.Clamp((liveAlt - pos.z) / 450, -1, 1)
-    local targetPitch  = math.Clamp(speedRatio * 4 + climbDelta * 7, -10, 10)
+    local fwdDir      = Angle(0, self.flightYaw, 0):Forward()
+    local vel         = IsValid(phys) and phys:GetVelocity() or (fwdDir * self.Speed)
+    local fwdSpeed    = vel:Dot(fwdDir)
+    local speedRatio  = math.Clamp(fwdSpeed / self.Speed, 0, 1.15)
+    local climbDelta  = math.Clamp((liveAlt - pos.z) / 450, -1, 1)
+    local targetPitch = math.Clamp(speedRatio * 4 + climbDelta * 7, -10, 10)
     self.SmoothedPitch = Lerp(0.04, self.SmoothedPitch, targetPitch)
 
-    -- MODEL_YAW_OFFSET is applied here unconditionally every tick.
-    -- It cannot be overridden: flightYaw is the travel direction,
-    -- self.ang.y is always flightYaw + MODEL_YAW_OFFSET.
     self.ang = Angle(
         self.SmoothedPitch,
         self.flightYaw + MODEL_YAW_OFFSET,
         self.SmoothedRoll
     )
 
+    -- Integrate position manually. Z is Lerped toward liveAlt.
     local newPos = pos + fwdDir * self.Speed * dt
     newPos.z = Lerp(0.08, pos.z, liveAlt)
 
+    -- Out-of-world safety
     if not util.IsInWorld(newPos) then
-        local rescueDir = (flatCenter - Vector(pos.x, pos.y, 0))
+        local rescueDir = flatCenter - Vector(pos.x, pos.y, 0)
         rescueDir.z = 0
         if rescueDir:LengthSqr() <= 0.001 then
             rescueDir = -fwdDir
             rescueDir.z = 0
         end
         rescueDir:Normalize()
-
         newPos = pos + rescueDir * self.Speed * dt
         newPos.z = math.min(pos.z, liveAlt)
         self.flightYaw = rescueDir:Angle().y
-        self.ang = Angle(
-            self.SmoothedPitch,
-            self.flightYaw + MODEL_YAW_OFFSET,
-            self.SmoothedRoll
-        )
+        self.ang = Angle(self.SmoothedPitch, self.flightYaw + MODEL_YAW_OFFSET, self.SmoothedRoll)
     end
 
+    -- Apply position and angle to entity only.
+    -- Do NOT call phys:SetPos or phys:SetVelocity here — that would cause
+    -- Havok to integrate the velocity on top of the manual SetPos, moving
+    -- the entity twice per tick and producing the teleport.
     self:SetPos(newPos)
     self:SetAngles(self.ang)
-
-    if IsValid(phys) then
-        phys:SetPos(newPos)
-        phys:SetAngles(self.ang)
-        phys:SetVelocity(fwdDir * self.Speed)
-    end
 
     if not self:IsInWorld() then
         self:Debug("Plane moved out of world, forcing center recovery")
         local safePos = Vector(self.CenterPos.x, self.CenterPos.y, self.sky)
         self:SetPos(safePos)
-        if IsValid(phys) then
-            phys:SetPos(safePos)
-            phys:SetVelocity(Vector(0, 0, 0))
-        end
     end
 end
 
