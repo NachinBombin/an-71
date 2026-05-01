@@ -108,8 +108,15 @@ function ENT:Initialize()
     self.OrbitDirection = (math.random(2) == 1) and 1 or -1
     self.OrbitBlend     = 0.08
     self.RadialGain     = 0.42
-    self.SkyAvoidGain   = 1.8   -- was 0.65 with QuickTrace; needs real authority
-    self.MaxTurnRate    = 32
+    self.SkyAvoidGain   = 1.8
+    -- MaxTurnRate: degrees per SECOND (multiplied by dt each tick).
+    -- 4.5 deg/s gives a wide, heavy-transport-style bank.
+    -- Avoidance works by sustained early pressure, not a late violent snap.
+    self.MaxTurnRate    = 4.5
+
+    -- Smoothed avoidance vector: persists across ticks so the correction
+    -- ramps up gradually instead of spiking desiredDir all at once.
+    self.SkyAvoidVec = Vector(0, 0, 0)
 
     -- Compute a tangent that roughly aligns with CallDir
     local right = Vector(-self.CallDir.y, self.CallDir.x, 0)
@@ -425,8 +432,7 @@ function ENT:PhysicsUpdate(phys)
     if CurTime() >= self.DieTime then self:Remove() return end
 
     -- ---- NORMAL FLIGHT PATH ----
-    -- Position integrated via SetPos only.  phys:SetPos / phys:SetVelocity
-    -- are NOT called so Havok does not move the entity a second time.
+    -- SetPos only; no phys:SetVelocity so Havok doesn't double-move.
 
     local pos = self:GetPos()
     local dt  = engine.TickInterval()
@@ -464,15 +470,13 @@ function ENT:PhysicsUpdate(phys)
 
     local desiredDir = tangentDir + radialDir * radialError * self.RadialGain
 
-    -- Sky / world-wall avoidance.
-    -- util.QuickTrace does NOT populate HitSky on its result; replaced with
-    -- util.TraceLine + MASK_SOLID_BRUSHONLY which correctly sets HitSky.
-    -- 5-probe fan: forward + two diagonals + two flanks.
-    -- Each hit contributes a weighted avoidance vector away from that direction.
-    local fwdDir     = Angle(0, self.flightYaw, 0):Forward()
-    local probeDist  = math.max(1200, self.Speed * 6)
+    -- ---- Sky / world-wall avoidance ----
+    -- probeDist is large so the plane sees the wall early and has room to
+    -- turn gently.  The raw probe result is Lerped into SkyAvoidVec so the
+    -- correction ramps up over several ticks instead of spiking instantly.
+    local probeDist  = math.max(2000, self.Speed * 8)
     local fanOffsets = { -60, -30, 0, 30, 60 }
-    local skyAvoid   = Vector(0, 0, 0)
+    local rawAvoid   = Vector(0, 0, 0)
 
     for _, yawOff in ipairs(fanOffsets) do
         local probeDir = Angle(0, self.flightYaw + yawOff, 0):Forward()
@@ -490,20 +494,30 @@ function ENT:PhysicsUpdate(phys)
             local urgency = 1 + (1 - tr.Fraction) * 3
             local awayDir = -probeDir
             awayDir.z = 0
-            skyAvoid = skyAvoid + awayDir * urgency
+            rawAvoid = rawAvoid + awayDir * urgency
         end
     end
 
-    if skyAvoid:LengthSqr() > 0.001 then
-        skyAvoid.z = 0
-        skyAvoid:Normalize()
-        desiredDir = desiredDir + skyAvoid * self.SkyAvoidGain
+    -- Normalize the raw result then Lerp into the persistent smoothed vector.
+    -- Approach is faster than decay so corrections build quickly but
+    -- taper off smoothly once the wall is clear.
+    if rawAvoid:LengthSqr() > 0.001 then
+        rawAvoid.z = 0
+        rawAvoid:Normalize()
+        self.SkyAvoidVec = LerpVector(0.06, self.SkyAvoidVec, rawAvoid)
+    else
+        self.SkyAvoidVec = LerpVector(0.03, self.SkyAvoidVec, Vector(0, 0, 0))
+    end
+
+    if self.SkyAvoidVec:LengthSqr() > 0.0001 then
+        desiredDir = desiredDir + self.SkyAvoidVec * self.SkyAvoidGain
     end
 
     desiredDir.z = 0
     if desiredDir:LengthSqr() <= 0.001 then desiredDir = tangentDir end
     desiredDir:Normalize()
 
+    -- Yaw toward desiredDir, hard-capped by MaxTurnRate deg/s.
     local desiredYaw = desiredDir:Angle().y
     local yawDiff    = math.NormalizeAngle(desiredYaw - self.flightYaw)
     local maxStep    = self.MaxTurnRate * dt
@@ -513,10 +527,12 @@ function ENT:PhysicsUpdate(phys)
     local rawYawDelta  = math.NormalizeAngle(self.flightYaw - (self.PrevYaw or self.flightYaw))
     self.PrevYaw       = self.flightYaw
 
-    local targetRoll  = math.Clamp(rawYawDelta * -2.0, -20, 20)
-    local rollLerp    = math.abs(rawYawDelta) > 0.01 and 0.12 or 0.04
+    -- Reduced roll multiplier and tighter clamp for believable transport bank
+    local targetRoll  = math.Clamp(rawYawDelta * -1.4, -15, 15)
+    local rollLerp    = math.abs(rawYawDelta) > 0.01 and 0.10 or 0.03
     self.SmoothedRoll = Lerp(rollLerp, self.SmoothedRoll, targetRoll)
 
+    local fwdDir      = Angle(0, self.flightYaw, 0):Forward()
     local vel         = IsValid(phys) and phys:GetVelocity() or (fwdDir * self.Speed)
     local fwdSpeed    = vel:Dot(fwdDir)
     local speedRatio  = math.Clamp(fwdSpeed / self.Speed, 0, 1.15)
@@ -530,13 +546,11 @@ function ENT:PhysicsUpdate(phys)
         self.SmoothedRoll
     )
 
-    -- Integrate position. Z Lerped toward liveAlt.
     local newPos = pos + fwdDir * self.Speed * dt
     newPos.z = Lerp(0.08, pos.z, liveAlt)
 
-    -- Last-resort: if the computed next position is still out of world,
-    -- steer toward center without any position snap or teleport.
-    -- The fan probes above should catch the wall long before this fires.
+    -- Last-resort steer (no teleport): if next pos is out of world,
+    -- redirect toward center for this one tick.
     if not util.IsInWorld(newPos) then
         self:Debug("Out-of-world safety steer fired (probes should have caught this)")
         local rescueDir = flatCenter - Vector(pos.x, pos.y, 0)
