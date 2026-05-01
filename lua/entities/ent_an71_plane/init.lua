@@ -92,7 +92,7 @@ function ENT:Initialize()
     self.sky           = ground + self.SkyHeightAdd
     self.DieTime       = CurTime() + self.Lifetime
     self.SpawnTime     = CurTime()
-    self.NextAlertTime = CurTime()  -- port: seed immediately so Think fires on first tick
+    self.NextAlertTime = CurTime()
     self.IsDestroyed   = false
     self.DamageTier    = 0
 
@@ -105,21 +105,19 @@ function ENT:Initialize()
     self.TumbleAngVelocity = Vector(0, 0, 0)
 
     -- Orbit state
+    -- OrbitDirection: +1 = clockwise (right-hand), -1 = counter-clockwise.
     self.OrbitDirection = (math.random(2) == 1) and 1 or -1
-    self.OrbitBlend     = 0.08
-    self.RadialGain     = 0.42
-    self.SkyAvoidGain   = 1.8
-    -- MaxTurnRate: degrees per SECOND (multiplied by dt each tick).
-    -- 4.5 deg/s gives a wide, heavy-transport-style bank.
-    -- Avoidance works by sustained early pressure, not a late violent snap.
-    self.MaxTurnRate    = 4.5
+    -- RadialGain: how hard the plane pulls back toward OrbitRadius when it
+    -- drifts.  0 = pure tangent flight, 1 = equal tangent + radial pull.
+    self.RadialGain     = 0.55
+    -- MaxTurnRate deg/s.  The minimum rate needed to hold a circle of radius
+    -- R at speed S is (S/R * 57.3) deg/s.  For R=3000, S=300 that is ~5.7
+    -- deg/s.  35 gives 6x headroom so the plane corrects quickly without
+    -- overshooting.
+    self.MaxTurnRate    = 35
 
-    -- Smoothed avoidance vector: persists across ticks so the correction
-    -- ramps up gradually instead of spiking desiredDir all at once.
-    self.SkyAvoidVec = Vector(0, 0, 0)
-
-    -- Compute a tangent that roughly aligns with CallDir
-    local right = Vector(-self.CallDir.y, self.CallDir.x, 0)
+    -- Compute initial flight heading as the orbit tangent at the spawn point.
+    local right   = Vector(-self.CallDir.y, self.CallDir.x, 0)
     local tangent = self.CallDir * math.cos(0) + right * math.sin(0)
     tangent.z = 0
     tangent:Normalize()
@@ -140,7 +138,7 @@ function ENT:Initialize()
     end)
 
     local spawnOffset = self.OrbitTangent * (-self.OrbitRadius * math.Rand(0.55, 0.95))
-    local spawnPos = self.CenterPos + spawnOffset
+    local spawnPos    = self.CenterPos + spawnOffset
     spawnPos = Vector(spawnPos.x, spawnPos.y, self.sky)
 
     if not util.IsInWorld(spawnPos) then
@@ -161,7 +159,6 @@ function ENT:Initialize()
     self:SetPos(spawnPos)
 
     self:SetBodygroup(0, 1)
-
     self:SetRenderMode(RENDERMODE_TRANSALPHA)
     self:SetColor(Color(255, 255, 255, 0))
 
@@ -290,7 +287,7 @@ function ENT:StartTumble()
     )
 
     local pos = self:GetPos()
-    local ed = EffectData()
+    local ed  = EffectData()
     ed:SetOrigin(pos)
     ed:SetScale(4) ed:SetMagnitude(4) ed:SetRadius(400)
     util.Effect("500lb_air", ed, true, true)
@@ -320,7 +317,7 @@ function ENT:CrashExplode()
     util.Effect("500lb_air", ed4, true, true)
 
     sound.Play("ambient/explosions/explode_8.wav", pos, 140, 90, 1.0)
-    sound.Play("weapon_AWP.Single", pos, 145, 60, 1.0)
+    sound.Play("weapon_AWP.Single",                pos, 145, 60, 1.0)
 
     util.BlastDamage(self, self, pos, 400, 200)
     self:Remove()
@@ -352,7 +349,11 @@ function ENT:Think()
         local pos     = self:GetPos()
         local groundZ = self.TumbleGroundZ or -16384
         if pos.z <= groundZ + 150 then self:CrashExplode() return end
-        local tr = util.TraceLine({ start = pos, endpos = pos + Vector(0,0,-200), filter = self })
+        local tr = util.TraceLine({
+            start  = pos,
+            endpos = pos + Vector(0, 0, -200),
+            filter = self,
+        })
         if tr.HitWorld then self:CrashExplode() return end
         self:NextThink(ct + 0.05)
         return true
@@ -367,8 +368,6 @@ function ENT:Think()
         self.PhysObj:Wake()
     end
 
-    -- NPC alert broadcast: feed every player's position into every NPC's
-    -- combat memory unconditionally, every AlertInterval seconds.
     if ct >= self.NextAlertTime then
         local npcs = ents.FindByClass("npc_*")
         local plys = player.GetAll()
@@ -387,7 +386,7 @@ function ENT:Think()
     local age   = ct - self.SpawnTime
     local left  = self.DieTime - ct
     if age < self.FadeDuration then
-        alpha = math.Clamp(255 * (age  / self.FadeDuration), 0, 255)
+        alpha = math.Clamp(255 * (age  / self.FadeDuration),  0, 255)
     elseif left < self.FadeDuration then
         alpha = math.Clamp(255 * (left / self.FadeDuration), 0, 255)
     end
@@ -434,113 +433,99 @@ function ENT:PhysicsUpdate(phys)
     if CurTime() >= self.DieTime then self:Remove() return end
 
     -- ---- NORMAL FLIGHT PATH ----
-    -- SetPos only; no phys:SetVelocity so Havok doesn't double-move.
+    -- Position driven entirely by SetPos; Havok is kept awake but not given
+    -- velocity so it cannot fight our integration.
 
     local pos = self:GetPos()
     local dt  = engine.TickInterval()
 
-    -- Altitude drift
+    -- ---- Altitude drift ----
+    -- Pick a new target altitude every 12-30 s within [sky-AltDriftRange, sky].
+    -- Hard-clamp liveAlt so we never push the plane above sky or below the
+    -- floor.  This replaces all horizontal skybox probe logic.
     if CurTime() >= self.AltDriftNextPick then
-        self.AltDriftTarget   = self.sky + math.Rand(-self.AltDriftRange, self.AltDriftRange)
+        self.AltDriftTarget   = self.sky - math.Rand(0, self.AltDriftRange)
         self.AltDriftNextPick = CurTime() + math.Rand(12, 30)
     end
     self.AltDriftCurrent = Lerp(self.AltDriftLerp, self.AltDriftCurrent, self.AltDriftTarget)
     self.JitterPhase = self.JitterPhase + 0.02
     local jitter  = math.sin(self.JitterPhase) * self.JitterAmplitude
-    local liveAlt = self.AltDriftCurrent + jitter
+    local liveAlt = math.Clamp(
+        self.AltDriftCurrent + jitter,
+        self.sky - self.AltDriftRange,
+        self.sky
+    )
 
-    -- Orbit steering
+    -- ---- Orbit steering ----
+    -- desiredDir = unit tangent to the orbit circle + a proportional radial
+    -- correction that pulls the plane back toward OrbitRadius when it drifts.
+    --
+    -- radialDir  : unit vector pointing from plane toward center (inward)
+    -- tangentDir : unit vector perpendicular to radialDir, in OrbitDirection
+    -- radialError: signed normalised distance error; +ve means outside radius
+    --
+    -- desiredDir = tangentDir + radialDir * radialError * RadialGain
+    -- then normalised.  This is a classic Stanley/pure-pursuit lateral
+    -- controller reduced to heading-only.
+
     local flatPos    = Vector(pos.x, pos.y, 0)
     local flatCenter = Vector(self.CenterPos.x, self.CenterPos.y, 0)
     local toCenter   = flatCenter - flatPos
     local dist       = toCenter:Length()
 
     local radialDir = Vector(0, 0, 0)
-    if dist > 1 then radialDir = toCenter / dist end
+    if dist > 1 then
+        radialDir = toCenter / dist
+    end
 
-    local tangentDir = Vector(-radialDir.y, radialDir.x, 0) * self.OrbitDirection
-    if tangentDir:LengthSqr() <= 0.001 then
+    -- Tangent: rotate radialDir 90 deg in OrbitDirection.
+    -- OrbitDirection +1 -> right-hand (CW from above), -1 -> CCW.
+    local tangentDir = Vector(-radialDir.y * self.OrbitDirection,
+                               radialDir.x * self.OrbitDirection, 0)
+    if tangentDir:LengthSqr() < 0.001 then
+        -- Fallback when exactly at center: keep current heading
         tangentDir = Angle(0, self.flightYaw, 0):Forward()
         tangentDir.z = 0
+        tangentDir:Normalize()
     end
-    tangentDir:Normalize()
 
     local radialError = 0
     if self.OrbitRadius > 0 then
-        radialError = math.Clamp((dist - self.OrbitRadius) / self.OrbitRadius, -1, 1)
+        -- Positive when outside radius, negative when inside.
+        radialError = math.Clamp(
+            (dist - self.OrbitRadius) / self.OrbitRadius,
+            -1, 1
+        )
     end
 
     local desiredDir = tangentDir + radialDir * radialError * self.RadialGain
-
-    -- ---- Sky / world-wall avoidance ----
-    -- probeDist is large so the plane sees the wall early and has room to
-    -- turn gently.  The raw probe result is Lerped into SkyAvoidVec so the
-    -- correction ramps up over several ticks instead of spiking instantly.
-    local probeDist  = math.max(2000, self.Speed * 8)
-    local fanOffsets = { -60, -30, 0, 30, 60 }
-    local rawAvoid   = Vector(0, 0, 0)
-
-    for _, yawOff in ipairs(fanOffsets) do
-        local probeDir = Angle(0, self.flightYaw + yawOff, 0):Forward()
-        probeDir.z = 0.12
-        probeDir:Normalize()
-
-        local tr = util.TraceLine({
-            start  = pos,
-            endpos = pos + probeDir * probeDist,
-            filter = self,
-            mask   = MASK_SOLID_BRUSHONLY,
-        })
-
-        if tr.Hit then
-            local urgency = 1 + (1 - tr.Fraction) * 3
-            local awayDir = -probeDir
-            awayDir.z = 0
-            rawAvoid = rawAvoid + awayDir * urgency
-        end
-    end
-
-    -- Normalize the raw result then Lerp into the persistent smoothed vector.
-    -- Approach is faster than decay so corrections build quickly but
-    -- taper off smoothly once the wall is clear.
-    if rawAvoid:LengthSqr() > 0.001 then
-        rawAvoid.z = 0
-        rawAvoid:Normalize()
-        self.SkyAvoidVec = LerpVector(0.06, self.SkyAvoidVec, rawAvoid)
-    else
-        self.SkyAvoidVec = LerpVector(0.03, self.SkyAvoidVec, Vector(0, 0, 0))
-    end
-
-    if self.SkyAvoidVec:LengthSqr() > 0.0001 then
-        desiredDir = desiredDir + self.SkyAvoidVec * self.SkyAvoidGain
-    end
-
     desiredDir.z = 0
-    if desiredDir:LengthSqr() <= 0.001 then desiredDir = tangentDir end
+    if desiredDir:LengthSqr() < 0.001 then desiredDir = tangentDir end
     desiredDir:Normalize()
 
-    -- Yaw toward desiredDir, hard-capped by MaxTurnRate deg/s.
+    -- ---- Yaw rate limiter ----
+    -- Clamp how fast flightYaw may change per tick.  MaxTurnRate is in
+    -- degrees/second; multiply by dt to get the per-tick cap.
     local desiredYaw = desiredDir:Angle().y
     local yawDiff    = math.NormalizeAngle(desiredYaw - self.flightYaw)
     local maxStep    = self.MaxTurnRate * dt
     self.flightYaw   = self.flightYaw + math.Clamp(yawDiff, -maxStep, maxStep)
 
-    -- Roll / pitch smoothing
-    local rawYawDelta  = math.NormalizeAngle(self.flightYaw - (self.PrevYaw or self.flightYaw))
-    self.PrevYaw       = self.flightYaw
+    -- ---- Visual roll & pitch ----
+    -- Roll is driven by the actual yaw rate (deg/s), not the raw per-tick
+    -- delta, so it looks the same regardless of server tickrate.
+    local rawYawDelta   = math.NormalizeAngle(self.flightYaw - (self.PrevYaw or self.flightYaw))
+    self.PrevYaw        = self.flightYaw
+    local yawRateDegS   = rawYawDelta / dt  -- deg/s
 
-    -- Reduced roll multiplier and tighter clamp for believable transport bank
-    local targetRoll  = math.Clamp(rawYawDelta * -1.4, -15, 15)
-    local rollLerp    = math.abs(rawYawDelta) > 0.01 and 0.10 or 0.03
-    self.SmoothedRoll = Lerp(rollLerp, self.SmoothedRoll, targetRoll)
+    local targetRoll    = math.Clamp(yawRateDegS * -0.5, -18, 18)
+    local rollLerp      = math.abs(rawYawDelta) > 0.005 and 0.07 or 0.025
+    self.SmoothedRoll   = Lerp(rollLerp, self.SmoothedRoll, targetRoll)
 
-    local fwdDir      = Angle(0, self.flightYaw, 0):Forward()
-    local vel         = IsValid(phys) and phys:GetVelocity() or (fwdDir * self.Speed)
-    local fwdSpeed    = vel:Dot(fwdDir)
-    local speedRatio  = math.Clamp(fwdSpeed / self.Speed, 0, 1.15)
-    local climbDelta  = math.Clamp((liveAlt - pos.z) / 450, -1, 1)
-    local targetPitch = math.Clamp(speedRatio * 4 + climbDelta * 7, -10, 10)
-    self.SmoothedPitch = Lerp(0.04, self.SmoothedPitch, targetPitch)
+    local fwdDir        = Angle(0, self.flightYaw, 0):Forward()
+    local climbDelta    = math.Clamp((liveAlt - pos.z) / 450, -1, 1)
+    local targetPitch   = math.Clamp(climbDelta * 6, -8, 8)
+    self.SmoothedPitch  = Lerp(0.035, self.SmoothedPitch, targetPitch)
 
     self.ang = Angle(
         self.SmoothedPitch,
@@ -548,23 +533,24 @@ function ENT:PhysicsUpdate(phys)
         self.SmoothedRoll
     )
 
+    -- ---- Position integration ----
     local newPos = pos + fwdDir * self.Speed * dt
-    newPos.z = Lerp(0.08, pos.z, liveAlt)
+    newPos.z     = Lerp(0.08, pos.z, liveAlt)
 
-    -- Last-resort steer (no teleport): if next pos is out of world,
-    -- redirect toward center for this one tick.
+    -- Absolute last resort: if somehow newPos is out of world (e.g. map edge
+    -- closer than OrbitRadius) steer toward center for one tick only.  No
+    -- teleport, no SetPos snap.
     if not util.IsInWorld(newPos) then
-        self:Debug("Out-of-world safety steer fired (probes should have caught this)")
+        self:Debug("Out-of-world safety steer (orbit should prevent this)")
         local rescueDir = flatCenter - Vector(pos.x, pos.y, 0)
         rescueDir.z = 0
-        if rescueDir:LengthSqr() <= 0.001 then
-            rescueDir = -fwdDir
-            rescueDir.z = 0
+        if rescueDir:LengthSqr() < 0.001 then
+            rescueDir = -fwdDir; rescueDir.z = 0
         end
         rescueDir:Normalize()
-        newPos = pos + rescueDir * self.Speed * dt
-        newPos.z = math.min(pos.z, liveAlt)
         self.flightYaw = rescueDir:Angle().y
+        newPos = pos + rescueDir * self.Speed * dt
+        newPos.z = liveAlt
         self.ang = Angle(self.SmoothedPitch, self.flightYaw + MODEL_YAW_OFFSET, self.SmoothedRoll)
     end
 
