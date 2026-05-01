@@ -104,11 +104,11 @@ function ENT:Initialize()
     self.TumbleVelocity    = Vector(0, 0, 0)
     self.TumbleAngVelocity = Vector(0, 0, 0)
 
-    -- Orbit state — fully randomised per spawn
+    -- Orbit state
     self.OrbitDirection = (math.random(2) == 1) and 1 or -1
     self.OrbitBlend     = 0.08
     self.RadialGain     = 0.42
-    self.SkyAvoidGain   = 0.65
+    self.SkyAvoidGain   = 1.8   -- was 0.65 with QuickTrace; needs real authority
     self.MaxTurnRate    = 32
 
     -- Compute a tangent that roughly aligns with CallDir
@@ -158,8 +158,6 @@ function ENT:Initialize()
     self:SetRenderMode(RENDERMODE_TRANSALPHA)
     self:SetColor(Color(255, 255, 255, 0))
 
-    -- flightYaw tracks the actual direction of travel.
-    -- self.ang.y is always flightYaw + MODEL_YAW_OFFSET so the mesh faces forward.
     self.flightYaw = self.OrbitTangent:Angle().y
     self.PrevYaw   = self.flightYaw
     self.ang       = Angle(0, self.flightYaw + MODEL_YAW_OFFSET, 0)
@@ -408,14 +406,13 @@ function ENT:PhysicsUpdate(phys)
         local pos    = self:GetPos()
         local newPos = pos + self.TumbleVelocity * dt
 
-        local av   = self.TumbleAngVelocity
+        local av = self.TumbleAngVelocity
         self.ang = Angle(
             self.ang.p + av.x * dt,
             self.ang.y + av.y * dt,
             self.ang.r + av.z * dt
         )
 
-        -- Tumble uses full phys authority: both entity and phys object move together.
         self:SetPos(newPos)
         self:SetAngles(self.ang)
         if IsValid(phys) then
@@ -428,11 +425,8 @@ function ENT:PhysicsUpdate(phys)
     if CurTime() >= self.DieTime then self:Remove() return end
 
     -- ---- NORMAL FLIGHT PATH ----
-    -- Position is integrated here and applied via SetPos/SetAngles ONLY.
-    -- phys:SetPos / phys:SetVelocity are NOT called during normal flight.
-    -- Calling both SetPos and phys:SetVelocity causes the engine to move the
-    -- entity twice per tick (once from SetPos, once from Havok integrating the
-    -- velocity), producing the visible teleport/stutter at speed.
+    -- Position integrated via SetPos only.  phys:SetPos / phys:SetVelocity
+    -- are NOT called so Havok does not move the entity a second time.
 
     local pos = self:GetPos()
     local dt  = engine.TickInterval()
@@ -470,19 +464,38 @@ function ENT:PhysicsUpdate(phys)
 
     local desiredDir = tangentDir + radialDir * radialError * self.RadialGain
 
-    -- Sky-wall avoidance using the true travel direction
-    local forwardDir     = Angle(0, self.flightYaw, 0):Forward()
-    local skyProbeDist   = math.max(1200, self.Speed * 6)
-    local trForward      = util.QuickTrace(pos, forwardDir * skyProbeDist, self)
-    local trLeft         = util.QuickTrace(pos, forwardDir:Angle():Right() * -900 + forwardDir * 600, self)
-    local trRight        = util.QuickTrace(pos, forwardDir:Angle():Right() *  900 + forwardDir * 600, self)
+    -- Sky / world-wall avoidance.
+    -- util.QuickTrace does NOT populate HitSky on its result; replaced with
+    -- util.TraceLine + MASK_SOLID_BRUSHONLY which correctly sets HitSky.
+    -- 5-probe fan: forward + two diagonals + two flanks.
+    -- Each hit contributes a weighted avoidance vector away from that direction.
+    local fwdDir     = Angle(0, self.flightYaw, 0):Forward()
+    local probeDist  = math.max(1200, self.Speed * 6)
+    local fanOffsets = { -60, -30, 0, 30, 60 }
+    local skyAvoid   = Vector(0, 0, 0)
 
-    local skyAvoid = Vector(0, 0, 0)
-    if trForward.HitSky then skyAvoid = skyAvoid - forwardDir end
-    if trLeft.HitSky    then skyAvoid = skyAvoid + forwardDir:Angle():Right() end
-    if trRight.HitSky   then skyAvoid = skyAvoid - forwardDir:Angle():Right() end
-    skyAvoid.z = 0
+    for _, yawOff in ipairs(fanOffsets) do
+        local probeDir = Angle(0, self.flightYaw + yawOff, 0):Forward()
+        probeDir.z = 0.12
+        probeDir:Normalize()
+
+        local tr = util.TraceLine({
+            start  = pos,
+            endpos = pos + probeDir * probeDist,
+            filter = self,
+            mask   = MASK_SOLID_BRUSHONLY,
+        })
+
+        if tr.Hit then
+            local urgency = 1 + (1 - tr.Fraction) * 3
+            local awayDir = -probeDir
+            awayDir.z = 0
+            skyAvoid = skyAvoid + awayDir * urgency
+        end
+    end
+
     if skyAvoid:LengthSqr() > 0.001 then
+        skyAvoid.z = 0
         skyAvoid:Normalize()
         desiredDir = desiredDir + skyAvoid * self.SkyAvoidGain
     end
@@ -504,7 +517,6 @@ function ENT:PhysicsUpdate(phys)
     local rollLerp    = math.abs(rawYawDelta) > 0.01 and 0.12 or 0.04
     self.SmoothedRoll = Lerp(rollLerp, self.SmoothedRoll, targetRoll)
 
-    local fwdDir      = Angle(0, self.flightYaw, 0):Forward()
     local vel         = IsValid(phys) and phys:GetVelocity() or (fwdDir * self.Speed)
     local fwdSpeed    = vel:Dot(fwdDir)
     local speedRatio  = math.Clamp(fwdSpeed / self.Speed, 0, 1.15)
@@ -518,12 +530,15 @@ function ENT:PhysicsUpdate(phys)
         self.SmoothedRoll
     )
 
-    -- Integrate position manually. Z is Lerped toward liveAlt.
+    -- Integrate position. Z Lerped toward liveAlt.
     local newPos = pos + fwdDir * self.Speed * dt
     newPos.z = Lerp(0.08, pos.z, liveAlt)
 
-    -- Out-of-world safety
+    -- Last-resort: if the computed next position is still out of world,
+    -- steer toward center without any position snap or teleport.
+    -- The fan probes above should catch the wall long before this fires.
     if not util.IsInWorld(newPos) then
+        self:Debug("Out-of-world safety steer fired (probes should have caught this)")
         local rescueDir = flatCenter - Vector(pos.x, pos.y, 0)
         rescueDir.z = 0
         if rescueDir:LengthSqr() <= 0.001 then
@@ -537,18 +552,8 @@ function ENT:PhysicsUpdate(phys)
         self.ang = Angle(self.SmoothedPitch, self.flightYaw + MODEL_YAW_OFFSET, self.SmoothedRoll)
     end
 
-    -- Apply position and angle to entity only.
-    -- Do NOT call phys:SetPos or phys:SetVelocity here — that would cause
-    -- Havok to integrate the velocity on top of the manual SetPos, moving
-    -- the entity twice per tick and producing the teleport.
     self:SetPos(newPos)
     self:SetAngles(self.ang)
-
-    if not self:IsInWorld() then
-        self:Debug("Plane moved out of world, forcing center recovery")
-        local safePos = Vector(self.CenterPos.x, self.CenterPos.y, self.sky)
-        self:SetPos(safePos)
-    end
 end
 
 -- ============================================================
