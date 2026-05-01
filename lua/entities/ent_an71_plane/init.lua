@@ -92,12 +92,50 @@ function ENT:Initialize()
     self.DamageTier    = 0
 
     -- Tumble state
-    self.IsTumbling       = false
-    self.TumbleStartTime  = 0
-    self.TumbleGroundZ    = ground
-    self.TumbleCrashed    = false
-    self.TumbleVelocity   = Vector(0, 0, 0)   -- linear  HU/s, manually integrated
-    self.TumbleAngVelocity = Vector(0, 0, 0)  -- deg/s  (pitch, yaw, roll)
+    self.IsTumbling        = false
+    self.TumbleStartTime   = 0
+    self.TumbleGroundZ     = ground
+    self.TumbleCrashed     = false
+    self.TumbleVelocity    = Vector(0, 0, 0)
+    self.TumbleAngVelocity = Vector(0, 0, 0)
+
+    -- Orbit state
+    self.OrbitNormal = VectorRand()
+    self.OrbitNormal.z = math.Rand(-0.25, 0.25)
+    if self.OrbitNormal:LengthSqr() < 0.001 then
+        self.OrbitNormal = Vector(0, 0, 1)
+    end
+    self.OrbitNormal:Normalize()
+
+    local outward = VectorRand()
+    outward.z = math.Rand(-0.08, 0.08)
+    if outward:LengthSqr() < 0.001 then
+        outward = self.CallDir * -1
+    end
+    outward:Normalize()
+
+    local tangent = self.OrbitNormal:Cross(outward)
+    if tangent:LengthSqr() < 0.001 then
+        tangent = self.CallDir
+    end
+    tangent.z = 0
+    if tangent:LengthSqr() < 0.001 then
+        tangent = Vector(1, 0, 0)
+    end
+    tangent:Normalize()
+
+    if tangent:Dot(self.CallDir) < 0 then
+        tangent = -tangent
+    end
+
+    self.OrbitDirection = (math.random(2) == 1) and 1 or -1
+    self.OrbitTangent   = tangent * self.OrbitDirection
+    self.OrbitPhase     = math.Rand(0, math.pi * 2)
+    self.OrbitNoiseSeed = math.Rand(0, 1000)
+    self.OrbitBlend     = 0.08
+    self.RadialGain     = 0.42
+    self.SkyAvoidGain   = 0.65
+    self.MaxTurnRate    = 32
 
     for _, ent in ipairs(ents.GetAll()) do
         if IsValid(ent) and ent:IsNPC() then
@@ -113,7 +151,8 @@ function ENT:Initialize()
         end
     end)
 
-    local spawnPos = self.CenterPos - self.CallDir * 2000
+    local spawnOffset = self.OrbitTangent * (-self.OrbitRadius * math.Rand(0.55, 0.95))
+    local spawnPos = self.CenterPos + spawnOffset
     spawnPos = Vector(spawnPos.x, spawnPos.y, self.sky)
 
     if not util.IsInWorld(spawnPos) then
@@ -138,7 +177,7 @@ function ENT:Initialize()
     self:SetRenderMode(RENDERMODE_TRANSALPHA)
     self:SetColor(Color(255, 255, 255, 0))
 
-    local angYaw   = self.CallDir:Angle().y
+    local angYaw   = self.OrbitTangent:Angle().y
     self.ang       = Angle(0, angYaw + 180, 0)
     self.flightYaw = angYaw
     self.PrevYaw   = self.flightYaw
@@ -236,36 +275,29 @@ end
 -- TUMBLE SYSTEM
 -- ============================================================
 
--- Seeds the manual-simulation state and fires the hit burst.
--- Everything after this is driven inside PhysicsUpdate.
 function ENT:StartTumble()
     self.IsTumbling      = true
     self.TumbleStartTime = CurTime()
     self.TumbleCrashed   = false
 
-    -- Refresh ground reference from current position
     local gnd = self:FindGround(self:GetPos())
     if gnd ~= -1 then self.TumbleGroundZ = gnd end
 
-    -- Seed linear velocity: full forward speed + strong initial nose-down
-    -- (the "dive" component -- wreck arcs forward and down, not straight down)
     local fwd   = self:GetForward()
     local speed = self.Speed or 300
     self.TumbleVelocity = Vector(
         fwd.x * speed,
         fwd.y * speed,
-        fwd.z * speed - 200   -- initial downward kick
+        fwd.z * speed - 200
     )
 
-    -- Seed angular velocity (degrees / second)
     local sign = function() return (math.random(2) == 1) and 1 or -1 end
     self.TumbleAngVelocity = Vector(
-        math.Rand(80,  200) * sign(),   -- pitch rate
-        math.Rand(20,  80)  * sign(),   -- yaw rate
-        math.Rand(150, 400) * sign()    -- roll rate (dominant)
+        math.Rand(80,  200) * sign(),
+        math.Rand(20,  80)  * sign(),
+        math.Rand(150, 400) * sign()
     )
 
-    -- Initial hit burst
     local pos = self:GetPos()
     local ed = EffectData()
     ed:SetOrigin(pos)
@@ -274,7 +306,6 @@ function ENT:StartTumble()
     sound.Play("ambient/explosions/explode_4.wav", pos, 135, 95, 1.0)
 end
 
--- Detonates the wreck on ground contact.
 function ENT:CrashExplode()
     if self.TumbleCrashed then return end
     self.TumbleCrashed = true
@@ -302,7 +333,7 @@ function ENT:CrashExplode()
     util.Effect("500lb_air", ed4, true, true)
 
     sound.Play("ambient/explosions/explode_8.wav", pos, 140, 90, 1.0)
-    sound.Play("weapon_AWP.Single",               pos, 145, 60, 1.0)
+    sound.Play("weapon_AWP.Single", pos, 145, 60, 1.0)
 
     util.BlastDamage(self, self, pos, 400, 200)
 
@@ -316,7 +347,6 @@ function ENT:DestroyPlane()
     self:FadeAndStopSounds(0.3)
     self:StartTumble()
 
-    -- Safety: force-remove if crash detector never fires
     timer.Simple(12, function()
         if IsValid(self) then self:CrashExplode() end
     end)
@@ -334,7 +364,6 @@ function ENT:Think()
 
     local ct = CurTime()
 
-    -- Tumble altitude monitor at 20 Hz
     if self.IsTumbling and not self.TumbleCrashed then
         local pos     = self:GetPos()
         local groundZ = self.TumbleGroundZ or -16384
@@ -400,13 +429,8 @@ function ENT:Think()
 end
 
 -- ============================================================
--- PHYSICS UPDATE  (flight steering + manual tumble simulation)
+-- PHYSICS UPDATE
 -- ============================================================
-
--- Source's Havok object is effectively kinematic after being manually
--- driven every tick during flight -- handing it back to the engine
--- produces no movement.  The tumble is therefore simulated manually
--- here, exactly like the flight loop, so both are under full control.
 
 function ENT:PhysicsUpdate(phys)
     if not self.DieTime or not self.sky then return end
@@ -415,16 +439,13 @@ function ENT:PhysicsUpdate(phys)
         if self.TumbleCrashed then return end
 
         local dt      = engine.TickInterval()
-        local gravity = physenv.GetGravity().z  -- typically -600 HU/s^2
+        local gravity = physenv.GetGravity().z
 
-        -- Accumulate gravity into the vertical velocity component
         self.TumbleVelocity.z = self.TumbleVelocity.z + gravity * dt
 
-        -- Integrate position
         local pos    = self:GetPos()
         local newPos = pos + self.TumbleVelocity * dt
 
-        -- Integrate angles from stored angular rates (deg/s)
         local av  = self.TumbleAngVelocity
         self.ang  = Angle(
             self.ang.p + av.x * dt,
@@ -440,8 +461,6 @@ function ENT:PhysicsUpdate(phys)
         end
         return
     end
-
-    -- ---- normal flight steering below ----
 
     if CurTime() >= self.DieTime then self:Remove() return end
 
@@ -460,51 +479,117 @@ function ENT:PhysicsUpdate(phys)
 
     local flatPos    = Vector(pos.x, pos.y, 0)
     local flatCenter = Vector(self.CenterPos.x, self.CenterPos.y, 0)
-    local dist       = flatPos:Distance(flatCenter)
+    local toCenter   = flatCenter - flatPos
+    local dist       = toCenter:Length()
 
-    local orbitYaw = 0
-    if dist > self.OrbitRadius and (self.TurnDelay or 0) < CurTime() then
-        orbitYaw       = 0.1
-        self.TurnDelay = CurTime() + 0.02
+    local radialDir = Vector(0, 0, 0)
+    if dist > 1 then
+        radialDir = toCenter / dist
     end
 
-    local flightFwd = Angle(0, self.flightYaw, 0):Forward()
-    local trSky     = util.QuickTrace(pos, flightFwd * 3000, self)
-    local skyYaw    = trSky.HitSky and 0.3 or 0
+    local tangentDir = Vector(-radialDir.y, radialDir.x, 0) * self.OrbitDirection
+    if tangentDir:LengthSqr() <= 0.001 then
+        tangentDir = Angle(0, self.flightYaw, 0):Forward()
+        tangentDir.z = 0
+    end
+    tangentDir:Normalize()
 
-    local yawDelta = orbitYaw + skyYaw
-    self.flightYaw = self.flightYaw + yawDelta
-    self.ang.y     = self.ang.y     + yawDelta
+    local radialError = 0
+    if self.OrbitRadius > 0 then
+        radialError = math.Clamp((dist - self.OrbitRadius) / self.OrbitRadius, -1, 1)
+    end
+
+    local desiredDir = tangentDir + radialDir * radialError * self.RadialGain
+
+    local skyProbeDist = math.max(1200, self.Speed * 6)
+    local forwardDir = Angle(0, self.flightYaw, 0):Forward()
+    local trForward  = util.QuickTrace(pos, forwardDir * skyProbeDist, self)
+    local trLeft     = util.QuickTrace(pos, forwardDir:Angle():Right() * -900 + forwardDir * 600, self)
+    local trRight    = util.QuickTrace(pos, forwardDir:Angle():Right() *  900 + forwardDir * 600, self)
+
+    local skyAvoid = Vector(0, 0, 0)
+    if trForward.HitSky then
+        skyAvoid = skyAvoid - forwardDir
+    end
+    if trLeft.HitSky then
+        skyAvoid = skyAvoid + forwardDir:Angle():Right()
+    end
+    if trRight.HitSky then
+        skyAvoid = skyAvoid - forwardDir:Angle():Right()
+    end
+    skyAvoid.z = 0
+    if skyAvoid:LengthSqr() > 0.001 then
+        skyAvoid:Normalize()
+        desiredDir = desiredDir + skyAvoid * self.SkyAvoidGain
+    end
+
+    desiredDir.z = 0
+    if desiredDir:LengthSqr() <= 0.001 then
+        desiredDir = tangentDir
+    end
+    desiredDir:Normalize()
+
+    local desiredYaw = desiredDir:Angle().y
+    local yawDiff    = math.NormalizeAngle(desiredYaw - self.flightYaw)
+    local maxStep    = self.MaxTurnRate * dt
+    local yawStep    = math.Clamp(yawDiff, -maxStep, maxStep)
+
+    self.flightYaw = self.flightYaw + yawStep
+    self.ang.y     = self.flightYaw
 
     local rawYawDelta  = math.NormalizeAngle(self.flightYaw - (self.PrevYaw or self.flightYaw))
     self.PrevYaw       = self.flightYaw
 
-    local targetRoll   = math.Clamp(rawYawDelta * -18, -15, 15)
-    local rollLerp     = rawYawDelta ~= 0 and 0.08 or 0.03
+    local targetRoll   = math.Clamp(rawYawDelta * -2.0, -20, 20)
+    local rollLerp     = math.abs(rawYawDelta) > 0.01 and 0.12 or 0.04
     self.SmoothedRoll  = Lerp(rollLerp, self.SmoothedRoll, targetRoll)
 
-    local fwdSpeed     = IsValid(phys) and phys:GetVelocity():Dot(flightFwd) or self.Speed
-    local speedRatio   = math.Clamp(fwdSpeed / self.Speed, 0, 1)
-    local targetPitch  = math.Clamp(speedRatio * 6, -8, 8)
-    self.SmoothedPitch = Lerp(0.02, self.SmoothedPitch, targetPitch)
+    local fwdDir       = Angle(0, self.flightYaw, 0):Forward()
+    local vel          = IsValid(phys) and phys:GetVelocity() or (fwdDir * self.Speed)
+    local fwdSpeed     = vel:Dot(fwdDir)
+    local speedRatio   = math.Clamp(fwdSpeed / self.Speed, 0, 1.15)
+    local climbDelta   = math.Clamp((liveAlt - pos.z) / 450, -1, 1)
+    local targetPitch  = math.Clamp(speedRatio * 4 + climbDelta * 7, -10, 10)
+    self.SmoothedPitch = Lerp(0.04, self.SmoothedPitch, targetPitch)
 
     self.ang.p = self.SmoothedPitch
     self.ang.r = self.SmoothedRoll
 
-    local fwdDir = Angle(0, self.flightYaw, 0):Forward()
-    local newPos = Vector(pos.x, pos.y, liveAlt) + fwdDir * self.Speed * dt
+    local newPos = pos + fwdDir * self.Speed * dt
+    newPos.z = Lerp(0.08, pos.z, liveAlt)
+
+    if not util.IsInWorld(newPos) then
+        local rescueDir = (flatCenter - Vector(pos.x, pos.y, 0))
+        rescueDir.z = 0
+        if rescueDir:LengthSqr() <= 0.001 then
+            rescueDir = -fwdDir
+            rescueDir.z = 0
+        end
+        rescueDir:Normalize()
+
+        newPos = pos + rescueDir * self.Speed * dt
+        newPos.z = math.min(pos.z, liveAlt)
+        self.flightYaw = rescueDir:Angle().y
+        self.ang.y = self.flightYaw
+    end
 
     self:SetPos(newPos)
     self:SetAngles(self.ang)
 
     if IsValid(phys) then
         phys:SetPos(newPos)
+        phys:SetAngles(self.ang)
         phys:SetVelocity(fwdDir * self.Speed)
     end
 
     if not self:IsInWorld() then
-        self:Debug("Plane moved out of world")
-        self:Remove()
+        self:Debug("Plane moved out of world, forcing center recovery")
+        local safePos = Vector(self.CenterPos.x, self.CenterPos.y, self.sky)
+        self:SetPos(safePos)
+        if IsValid(phys) then
+            phys:SetPos(safePos)
+            phys:SetVelocity(Vector(0, 0, 0))
+        end
     end
 end
 
