@@ -92,7 +92,7 @@ function ENT:Initialize()
     self.sky           = ground + self.SkyHeightAdd
     self.DieTime       = CurTime() + self.Lifetime
     self.SpawnTime     = CurTime()
-    self.NextAlertTime = CurTime()
+    self.NextAlertTime = CurTime()  -- port: seed immediately so Think fires on first tick
     self.IsDestroyed   = false
     self.DamageTier    = 0
 
@@ -367,6 +367,8 @@ function ENT:Think()
         self.PhysObj:Wake()
     end
 
+    -- NPC alert broadcast: feed every player's position into every NPC's
+    -- combat memory unconditionally, every AlertInterval seconds.
     if ct >= self.NextAlertTime then
         local npcs = ents.FindByClass("npc_*")
         local plys = player.GetAll()
