@@ -92,10 +92,12 @@ function ENT:Initialize()
     self.DamageTier    = 0
 
     -- Tumble state
-    self.IsTumbling      = false
-    self.TumbleStartTime = 0
-    self.TumbleGroundZ   = ground
-    self.TumbleCrashed   = false
+    self.IsTumbling       = false
+    self.TumbleStartTime  = 0
+    self.TumbleGroundZ    = ground
+    self.TumbleCrashed    = false
+    self.TumbleVelocity   = Vector(0, 0, 0)   -- linear  HU/s, manually integrated
+    self.TumbleAngVelocity = Vector(0, 0, 0)  -- deg/s  (pitch, yaw, roll)
 
     for _, ent in ipairs(ents.GetAll()) do
         if IsValid(ent) and ent:IsNPC() then
@@ -234,37 +236,34 @@ end
 -- TUMBLE SYSTEM
 -- ============================================================
 
--- Called once when HP hits 0.  Kicks the plane out of controlled flight
--- and into a physics-driven dive+tumble that ends with CrashExplode().
+-- Seeds the manual-simulation state and fires the hit burst.
+-- Everything after this is driven inside PhysicsUpdate.
 function ENT:StartTumble()
     self.IsTumbling      = true
     self.TumbleStartTime = CurTime()
     self.TumbleCrashed   = false
 
-    -- Refresh ground reference from the current position
+    -- Refresh ground reference from current position
     local gnd = self:FindGround(self:GetPos())
     if gnd ~= -1 then self.TumbleGroundZ = gnd end
 
-    local phys = self:GetPhysicsObject()
-    if IsValid(phys) then
-        -- Hand full control back to the physics engine
-        phys:EnableGravity(true)
-        phys:Wake()
+    -- Seed linear velocity: full forward speed + strong initial nose-down
+    -- (the "dive" component -- wreck arcs forward and down, not straight down)
+    local fwd   = self:GetForward()
+    local speed = self.Speed or 300
+    self.TumbleVelocity = Vector(
+        fwd.x * speed,
+        fwd.y * speed,
+        fwd.z * speed - 200   -- initial downward kick
+    )
 
-        -- Seed velocity: preserve forward flight speed, add strong nose-down
-        -- component so the wreck arcs forward+down (dive) not straight down.
-        local fwd     = self:GetForward()
-        local speed   = self.Speed or 300
-        phys:SetVelocity(fwd * speed + Vector(0, 0, -600))
-
-        -- Seed angular velocity: heavy roll bias, random signs each crash
-        local sign = function() return (math.random(2) == 1) and 1 or -1 end
-        phys:SetAngleVelocity(Vector(
-            math.Rand(80,  200) * sign(),   -- pitch
-            math.Rand(20,  80)  * sign(),   -- yaw
-            math.Rand(150, 400) * sign()    -- roll (dominant)
-        ))
-    end
+    -- Seed angular velocity (degrees / second)
+    local sign = function() return (math.random(2) == 1) and 1 or -1 end
+    self.TumbleAngVelocity = Vector(
+        math.Rand(80,  200) * sign(),   -- pitch rate
+        math.Rand(20,  80)  * sign(),   -- yaw rate
+        math.Rand(150, 400) * sign()    -- roll rate (dominant)
+    )
 
     -- Initial hit burst
     local pos = self:GetPos()
@@ -275,7 +274,7 @@ function ENT:StartTumble()
     sound.Play("ambient/explosions/explode_4.wav", pos, 135, 95, 1.0)
 end
 
--- Detonates the wreck on ground contact and removes the entity.
+-- Detonates the wreck on ground contact.
 function ENT:CrashExplode()
     if self.TumbleCrashed then return end
     self.TumbleCrashed = true
@@ -315,15 +314,11 @@ function ENT:DestroyPlane()
     self.IsDestroyed = true
 
     self:FadeAndStopSounds(0.3)
-
-    -- Hand off to the tumble system instead of instant removal
     self:StartTumble()
 
-    -- Safety net: if the crash detector somehow never fires, force-remove
+    -- Safety: force-remove if crash detector never fires
     timer.Simple(12, function()
-        if IsValid(self) then
-            self:CrashExplode()
-        end
+        if IsValid(self) then self:CrashExplode() end
     end)
 end
 
@@ -339,18 +334,16 @@ function ENT:Think()
 
     local ct = CurTime()
 
-    -- Tumble altitude monitor (runs at 20 Hz to stay responsive)
+    -- Tumble altitude monitor at 20 Hz
     if self.IsTumbling and not self.TumbleCrashed then
         local pos     = self:GetPos()
         local groundZ = self.TumbleGroundZ or -16384
 
-        -- Direct altitude check
         if pos.z <= groundZ + 150 then
             self:CrashExplode()
             return
         end
 
-        -- Short downward trace to catch sloped terrain or geometry above groundZ
         local tr = util.TraceLine({
             start  = pos,
             endpos = pos + Vector(0, 0, -200),
@@ -407,17 +400,48 @@ function ENT:Think()
 end
 
 -- ============================================================
--- PHYSICS UPDATE  (flight steering only -- tumble is hands-off)
+-- PHYSICS UPDATE  (flight steering + manual tumble simulation)
 -- ============================================================
+
+-- Source's Havok object is effectively kinematic after being manually
+-- driven every tick during flight -- handing it back to the engine
+-- produces no movement.  The tumble is therefore simulated manually
+-- here, exactly like the flight loop, so both are under full control.
 
 function ENT:PhysicsUpdate(phys)
     if not self.DieTime or not self.sky then return end
 
-    -- During tumble the physics engine owns EVERYTHING: position, linear
-    -- velocity, AND angular velocity.  We must not call SetVelocity or
-    -- SetAngleVelocity here or we will override the spin and kill the
-    -- forward momentum, making the wreck fall straight down.
-    if self.IsTumbling then return end
+    if self.IsTumbling then
+        if self.TumbleCrashed then return end
+
+        local dt      = engine.TickInterval()
+        local gravity = physenv.GetGravity().z  -- typically -600 HU/s^2
+
+        -- Accumulate gravity into the vertical velocity component
+        self.TumbleVelocity.z = self.TumbleVelocity.z + gravity * dt
+
+        -- Integrate position
+        local pos    = self:GetPos()
+        local newPos = pos + self.TumbleVelocity * dt
+
+        -- Integrate angles from stored angular rates (deg/s)
+        local av  = self.TumbleAngVelocity
+        self.ang  = Angle(
+            self.ang.p + av.x * dt,
+            self.ang.y + av.y * dt,
+            self.ang.r + av.z * dt
+        )
+
+        self:SetPos(newPos)
+        self:SetAngles(self.ang)
+        if IsValid(phys) then
+            phys:SetPos(newPos)
+            phys:SetAngles(self.ang)
+        end
+        return
+    end
+
+    -- ---- normal flight steering below ----
 
     if CurTime() >= self.DieTime then self:Remove() return end
 
