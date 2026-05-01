@@ -289,12 +289,16 @@ function ENT:StartTumble()
     local gnd = self:FindGround(self:GetPos())
     if gnd ~= -1 then self.TumbleGroundZ = gnd end
 
-    local fwd   = self:GetForward()
-    local speed = self.Speed or 300
+    -- Use flightYaw (the true direction of travel) NOT GetForward().
+    -- self.ang.y = flightYaw + MODEL_YAW_OFFSET (180°), so GetForward()
+    -- points opposite to travel. We reconstruct the real travel vector here.
+    local travelFwd = Angle(0, self.flightYaw, 0):Forward()
+    local speed     = self.Speed or 300
+
     self.TumbleVelocity = Vector(
-        fwd.x * speed,
-        fwd.y * speed,
-        fwd.z * speed - 200
+        travelFwd.x * speed,
+        travelFwd.y * speed,
+        -200
     )
 
     local sign = function() return (math.random(2) == 1) and 1 or -1 end
@@ -452,10 +456,12 @@ function ENT:PhysicsUpdate(phys)
         local pos    = self:GetPos()
         local newPos = pos + self.TumbleVelocity * dt
 
-        -- Integrate tumble angular velocity, then reapply model offset on yaw
-        local av = self.TumbleAngVelocity
+        -- Tumble angles spin freely — no MODEL_YAW_OFFSET applied here.
+        -- The offset only matters during normal flight to align the mesh;
+        -- during tumble the plane is out of control so raw spin looks correct.
+        local av  = self.TumbleAngVelocity
         local newP = self.ang.p + av.x * dt
-        local newY = self.ang.y + av.y * dt   -- raw yaw accumulates freely during tumble
+        local newY = self.ang.y + av.y * dt
         local newR = self.ang.r + av.z * dt
         self.ang = Angle(newP, newY, newR)
 
