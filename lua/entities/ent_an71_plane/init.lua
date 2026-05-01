@@ -6,6 +6,11 @@ include("shared.lua")
 local PASS_SOUND_A = "jet/luxor/medium.wav"
 local PASS_SOUND_B = "jet/luxor/external.wav"
 
+-- Permanent yaw correction so the model faces the direction of travel.
+-- This offset is ALWAYS added on top of flightYaw and must never be removed
+-- or overridden by flight steering logic.
+local MODEL_YAW_OFFSET = 180
+
 function ENT:Debug(msg)
     print("[AN-71 ENT] " .. msg)
 end
@@ -99,7 +104,7 @@ function ENT:Initialize()
     self.TumbleVelocity    = Vector(0, 0, 0)
     self.TumbleAngVelocity = Vector(0, 0, 0)
 
-    -- Orbit state
+    -- Orbit state — fully randomised per spawn
     self.OrbitNormal = VectorRand()
     self.OrbitNormal.z = math.Rand(-0.25, 0.25)
     if self.OrbitNormal:LengthSqr() < 0.001 then
@@ -177,10 +182,11 @@ function ENT:Initialize()
     self:SetRenderMode(RENDERMODE_TRANSALPHA)
     self:SetColor(Color(255, 255, 255, 0))
 
-    local angYaw   = self.OrbitTangent:Angle().y
-    self.ang       = Angle(0, angYaw + 180, 0)
-    self.flightYaw = angYaw
+    -- flightYaw tracks the actual direction of travel.
+    -- self.ang.y is always flightYaw + MODEL_YAW_OFFSET so the mesh faces forward.
+    self.flightYaw = self.OrbitTangent:Angle().y
     self.PrevYaw   = self.flightYaw
+    self.ang       = Angle(0, self.flightYaw + MODEL_YAW_OFFSET, 0)
 
     self.AltDriftCurrent  = self.sky
     self.AltDriftTarget   = self.sky
@@ -446,12 +452,12 @@ function ENT:PhysicsUpdate(phys)
         local pos    = self:GetPos()
         local newPos = pos + self.TumbleVelocity * dt
 
-        local av  = self.TumbleAngVelocity
-        self.ang  = Angle(
-            self.ang.p + av.x * dt,
-            self.ang.y + av.y * dt,
-            self.ang.r + av.z * dt
-        )
+        -- Integrate tumble angular velocity, then reapply model offset on yaw
+        local av = self.TumbleAngVelocity
+        local newP = self.ang.p + av.x * dt
+        local newY = self.ang.y + av.y * dt   -- raw yaw accumulates freely during tumble
+        local newR = self.ang.r + av.z * dt
+        self.ang = Angle(newP, newY, newR)
 
         self:SetPos(newPos)
         self:SetAngles(self.ang)
@@ -502,10 +508,10 @@ function ENT:PhysicsUpdate(phys)
     local desiredDir = tangentDir + radialDir * radialError * self.RadialGain
 
     local skyProbeDist = math.max(1200, self.Speed * 6)
-    local forwardDir = Angle(0, self.flightYaw, 0):Forward()
-    local trForward  = util.QuickTrace(pos, forwardDir * skyProbeDist, self)
-    local trLeft     = util.QuickTrace(pos, forwardDir:Angle():Right() * -900 + forwardDir * 600, self)
-    local trRight    = util.QuickTrace(pos, forwardDir:Angle():Right() *  900 + forwardDir * 600, self)
+    local forwardDir   = Angle(0, self.flightYaw, 0):Forward()
+    local trForward    = util.QuickTrace(pos, forwardDir * skyProbeDist, self)
+    local trLeft       = util.QuickTrace(pos, forwardDir:Angle():Right() * -900 + forwardDir * 600, self)
+    local trRight      = util.QuickTrace(pos, forwardDir:Angle():Right() *  900 + forwardDir * 600, self)
 
     local skyAvoid = Vector(0, 0, 0)
     if trForward.HitSky then
@@ -535,7 +541,6 @@ function ENT:PhysicsUpdate(phys)
     local yawStep    = math.Clamp(yawDiff, -maxStep, maxStep)
 
     self.flightYaw = self.flightYaw + yawStep
-    self.ang.y     = self.flightYaw
 
     local rawYawDelta  = math.NormalizeAngle(self.flightYaw - (self.PrevYaw or self.flightYaw))
     self.PrevYaw       = self.flightYaw
@@ -552,8 +557,14 @@ function ENT:PhysicsUpdate(phys)
     local targetPitch  = math.Clamp(speedRatio * 4 + climbDelta * 7, -10, 10)
     self.SmoothedPitch = Lerp(0.04, self.SmoothedPitch, targetPitch)
 
-    self.ang.p = self.SmoothedPitch
-    self.ang.r = self.SmoothedRoll
+    -- MODEL_YAW_OFFSET is applied here unconditionally every tick.
+    -- It cannot be overridden: flightYaw is the travel direction,
+    -- self.ang.y is always flightYaw + MODEL_YAW_OFFSET.
+    self.ang = Angle(
+        self.SmoothedPitch,
+        self.flightYaw + MODEL_YAW_OFFSET,
+        self.SmoothedRoll
+    )
 
     local newPos = pos + fwdDir * self.Speed * dt
     newPos.z = Lerp(0.08, pos.z, liveAlt)
@@ -570,7 +581,11 @@ function ENT:PhysicsUpdate(phys)
         newPos = pos + rescueDir * self.Speed * dt
         newPos.z = math.min(pos.z, liveAlt)
         self.flightYaw = rescueDir:Angle().y
-        self.ang.y = self.flightYaw
+        self.ang = Angle(
+            self.SmoothedPitch,
+            self.flightYaw + MODEL_YAW_OFFSET,
+            self.SmoothedRoll
+        )
     end
 
     self:SetPos(newPos)
