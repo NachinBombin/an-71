@@ -247,26 +247,23 @@ function ENT:StartTumble()
 
     local phys = self:GetPhysicsObject()
     if IsValid(phys) then
-        -- Re-enable gravity so the plane falls under its own weight
+        -- Hand full control back to the physics engine
         phys:EnableGravity(true)
         phys:Wake()
 
-        -- Combine forward momentum with a strong nose-down component.
-        -- This is the "dive" behaviour the autonomous-craft logic requires:
-        -- the wreck travels forward and downward rather than dropping straight.
-        local fwd    = self:GetForward()
-        local speed  = self.Speed or 300
-        local diveVel = fwd * speed + Vector(0, 0, -600)
-        phys:SetVelocity(diveVel)
+        -- Seed velocity: preserve forward flight speed, add strong nose-down
+        -- component so the wreck arcs forward+down (dive) not straight down.
+        local fwd     = self:GetForward()
+        local speed   = self.Speed or 300
+        phys:SetVelocity(fwd * speed + Vector(0, 0, -600))
 
-        -- Heavy roll spin with random signs so every crash looks different
+        -- Seed angular velocity: heavy roll bias, random signs each crash
         local sign = function() return (math.random(2) == 1) and 1 or -1 end
-        local tumbleSpin = Vector(
+        phys:SetAngleVelocity(Vector(
             math.Rand(80,  200) * sign(),   -- pitch
             math.Rand(20,  80)  * sign(),   -- yaw
-            math.Rand(150, 400) * sign()    -- roll (dominant axis)
-        )
-        phys:SetAngleVelocity(tumbleSpin)
+            math.Rand(150, 400) * sign()    -- roll (dominant)
+        ))
     end
 
     -- Initial hit burst
@@ -410,23 +407,17 @@ function ENT:Think()
 end
 
 -- ============================================================
--- PHYSICS UPDATE  (flight steering + tumble drag)
+-- PHYSICS UPDATE  (flight steering only -- tumble is hands-off)
 -- ============================================================
 
 function ENT:PhysicsUpdate(phys)
     if not self.DieTime or not self.sky then return end
 
-    -- During tumble the physics engine owns the trajectory.
-    -- We only bleed off horizontal speed to simulate aerodynamic drag so the
-    -- wreck arcs forward-and-down (dive) rather than flying level.
-    if self.IsTumbling then
-        if IsValid(phys) and not self.TumbleCrashed then
-            local vel   = phys:GetVelocity()
-            local decay = 0.97   -- gentle per-tick drag on the horizontal plane
-            phys:SetVelocity(Vector(vel.x * decay, vel.y * decay, vel.z))
-        end
-        return  -- no steering during tumble
-    end
+    -- During tumble the physics engine owns EVERYTHING: position, linear
+    -- velocity, AND angular velocity.  We must not call SetVelocity or
+    -- SetAngleVelocity here or we will override the spin and kill the
+    -- forward momentum, making the wreck fall straight down.
+    if self.IsTumbling then return end
 
     if CurTime() >= self.DieTime then self:Remove() return end
 
