@@ -18,7 +18,6 @@ if SERVER then
     local cv_radius     = CreateConVar("npc_an71_radius",     "3000", SHARED_FLAGS, "Orbit radius (HU).")
     local cv_height     = CreateConVar("npc_an71_height",     "6000", SHARED_FLAGS, "Height above ground (HU).")
     local cv_announce   = CreateConVar("npc_an71_announce",   "0",    SHARED_FLAGS, "Debug prints.")
-    -- Model yaw offset toggle: 0 = ang.y - 90 (same as AC-130), 1 = ang.y + 90
     CreateConVar("npc_an71_model_flip", "0", SHARED_FLAGS, "Flip model yaw offset: 0=same as AC-130 (-90), 1=flipped (+90).")
 
     local CALLERS = {
@@ -34,6 +33,12 @@ if SERVER then
         for _, ply in ipairs(player.GetHumans()) do
             if IsValid(ply) then ply:PrintMessage(HUD_PRINTCONSOLE, full) end
         end
+    end
+
+    -- Returns a random flat (z=0) unit vector — gives each spawn a unique orbit entry.
+    local function RandomFlatDir()
+        local ang = math.Rand(0, 360)
+        return Vector(math.cos(math.rad(ang)), math.sin(math.rad(ang)), 0)
     end
 
     local function CheckSkyAbove(pos)
@@ -88,7 +93,10 @@ if SERVER then
         return flare
     end
 
-    local function SpawnAN71AtPos(centerPos, callDir)
+    -- callDir is now purely a hint used only as a tiebreaker fallback inside the
+    -- entity's Initialize; the spawner always passes a fresh random direction so
+    -- no two planes share the same orbit entry angle.
+    local function SpawnAN71AtPos(centerPos)
         if not scripted_ents.GetStored("ent_an71_plane") then
             AN71_Debug("Plane spawn failed: ent_an71_plane is not registered")
             return false
@@ -100,10 +108,12 @@ if SERVER then
             return false
         end
 
+        local randomDir = RandomFlatDir()
+
         plane:SetPos(centerPos)
-        plane:SetAngles(callDir:Angle())
+        plane:SetAngles(randomDir:Angle())
         plane:SetVar("CenterPos",    centerPos)
-        plane:SetVar("CallDir",      callDir)
+        plane:SetVar("CallDir",      randomDir)
         plane:SetVar("Lifetime",     cv_life:GetFloat())
         plane:SetVar("Speed",        cv_speed:GetFloat())
         plane:SetVar("OrbitRadius",  cv_radius:GetFloat())
@@ -116,7 +126,7 @@ if SERVER then
             return false
         end
 
-        AN71_Debug("Plane entity created")
+        AN71_Debug("Plane entity created with random orbit dir " .. tostring(randomDir))
         return true
     end
 
@@ -133,26 +143,19 @@ if SERVER then
             AN71_Debug("Call rejected: no open sky above target") return false
         end
 
-        local callDir = targetPos - npc:GetPos()
-        callDir.z = 0
-        if callDir:LengthSqr() <= 1 then callDir = npc:GetForward() callDir.z = 0 end
-        if callDir:LengthSqr() <= 1 then callDir = Vector(1, 0, 0) end
-        callDir:Normalize()
-
         local flare = ThrowSupportFlare(npc, targetPos)
         if not IsValid(flare) then
             AN71_Debug("Call rejected: flare could not be created") return false
         end
 
         local fallbackPos = Vector(targetPos.x, targetPos.y, targetPos.z)
-        local storedDir   = Vector(callDir.x, callDir.y, callDir.z)
 
         AN71_Debug("Flare deployed, waiting " .. cv_delay:GetFloat() .. "s")
 
         timer.Simple(cv_delay:GetFloat(), function()
             local centerPos = IsValid(flare) and flare:GetPos() or fallbackPos
             AN71_Debug("Attempting plane spawn at " .. tostring(centerPos))
-            SpawnAN71AtPos(centerPos, storedDir)
+            SpawnAN71AtPos(centerPos)
         end)
 
         return true
@@ -161,12 +164,8 @@ if SERVER then
     -- Manual spawn via Q-menu button
     net.Receive("AN71_ManualSpawn", function(len, ply)
         if not IsValid(ply) then return end
-        local eyePos  = ply:EyePos()
-        local callDir = ply:EyeAngles():Forward()
-        callDir.z = 0
-        if callDir:LengthSqr() <= 1 then callDir = Vector(1, 0, 0) end
-        callDir:Normalize()
-        SpawnAN71AtPos(eyePos, callDir)
+        local eyePos = ply:EyePos()
+        SpawnAN71AtPos(eyePos)
         AN71_Debug("Manual spawn by " .. ply:Nick())
     end)
 
