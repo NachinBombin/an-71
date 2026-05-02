@@ -475,32 +475,18 @@ function ENT:PhysicsUpdate(phys)
     -- ============================================================
     -- COORDINATED TURN ROLL
     --
-    -- sustained: small constant bank during steady orbit.
-    --   turnRate ~5-8 deg/s in settled orbit.
-    --   At gain 2.2: 5 deg/s -> 11 deg, 8 deg/s -> 17 deg. Visible.
-    --
-    -- transient: lean-in pop driven by turn-rate derivative.
-    --   Zero during steady flight; spikes on entry/exit of turn.
-    --
-    -- Sign: turnRate positive = turning left = left wing should
-    -- drop = negative roll (Source Angle.r: positive = bank right).
-    -- So negate turnRate and delta for correct direction.
-    --
-    -- Lerp: banking IN  -> use fast lerp (ROLL_LERP_IN)
-    --       returning OUT -> use slow lerp (ROLL_LERP_OUT)
-    -- Direction test: if rollTarget and SmoothedRoll have the
-    -- same sign AND abs(rollTarget) > abs(SmoothedRoll) we are
-    -- still building bank -> fast.  Otherwise -> slow.
+    -- Source engine Angle.r convention on this model:
+    --   positive roll = bank INTO the turn (correct for this mesh).
+    -- turnRate positive = turning in the orbit direction.
+    -- So no negation needed -- roll follows turnRate directly.
     -- ============================================================
     local turnRateDelta = turnRate - self.PrevTurnRate
     self.PrevTurnRate   = turnRate
 
-    local sustained  = math.Clamp(-turnRate      * ROLL_SUSTAINED_GAIN, -20, 20)
-    local transient  = math.Clamp(-turnRateDelta * ROLL_TRANSIENT_GAIN, -12, 12)
+    local sustained  = math.Clamp(turnRate      * ROLL_SUSTAINED_GAIN, -20, 20)
+    local transient  = math.Clamp(turnRateDelta * ROLL_TRANSIENT_GAIN, -12, 12)
     local rollTarget = math.Clamp(sustained + transient, -ROLL_MAX, ROLL_MAX)
 
-    -- Are we still building toward rollTarget, or returning to zero?
-    -- "Building" = target and current share sign AND target is larger.
     local building = (rollTarget * self.SmoothedRoll >= 0)
                      and (math.abs(rollTarget) > math.abs(self.SmoothedRoll))
     local lerpRate = building and ROLL_LERP_IN or ROLL_LERP_OUT
