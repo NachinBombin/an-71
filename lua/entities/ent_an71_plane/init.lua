@@ -11,26 +11,25 @@ local MODEL_YAW_OFFSET = 180
 
 -- ============================================================
 -- ROLL CONSTANTS
--- Tuned for a large turboprop transport (AN-71 class).
+-- AN-71 class turboprop transport.
 --
--- SUSTAINED: degrees of bank per deg/s of steady turn rate.
---   At MaxTurnRate=28 deg/s this gives 28*0.28 = ~8 deg of
---   coordinated bank during the orbit -- visible but gentle.
---   A real transport banks 15-25 deg in a standard-rate turn;
---   8 deg reads as a shallow orbit pass.
+-- At a settled orbit turnRate is roughly 5-8 deg/s.
+-- ROLL_SUSTAINED_GAIN = 2.2 gives:
+--   5 deg/s  -> 11 deg bank  (gentle pass)
+--   8 deg/s  -> 17 deg bank  (tighter correction)
+--   28 deg/s -> capped at ROLL_MAX (never reached in normal orbit)
 --
--- TRANSIENT: degrees of roll per unit of turn-rate-delta per tick.
---   This drives the 'lean-in' pop as the plane enters or exits
---   a turn.  Only visible for a second or two; then decays.
+-- ROLL_TRANSIENT_GAIN drives the lean-in pop at turn entry/exit.
+-- It acts on the PER-TICK delta of turnRate so it is automatically
+-- zero during steady flight and spikes only when turn rate changes.
 --
--- MAX_ROLL: hard clamp.  18 deg looks convincing without making
---   the plane appear to be in a steep bank.
+-- ROLL_MAX = 25 deg -- heavy transport, not a fighter.
 -- ============================================================
-local ROLL_SUSTAINED_GAIN = 0.28   -- deg bank / (deg/s turn rate)
-local ROLL_TRANSIENT_GAIN = 18.0   -- deg bank / (delta deg/s per tick)
-local ROLL_MAX            = 18.0   -- absolute clamp, degrees
-local ROLL_LERP_IN        = 0.055  -- approach speed when banking in
-local ROLL_LERP_OUT       = 0.018  -- return speed when levelling out
+local ROLL_SUSTAINED_GAIN = 2.2    -- deg bank per (deg/s) turn rate
+local ROLL_TRANSIENT_GAIN = 55.0   -- deg bank per (deg/s change per tick)
+local ROLL_MAX            = 25.0   -- hard clamp, degrees
+local ROLL_LERP_IN        = 0.08   -- lean-in speed (brisk)
+local ROLL_LERP_OUT       = 0.012  -- return-to-level speed (lazy)
 
 function ENT:Debug(msg)
     print("[AN-71 ENT] " .. msg)
@@ -153,8 +152,8 @@ function ENT:Initialize()
     self.RadialGain     = 0.5
     self.MaxTurnRate    = 28
 
-    -- Roll state -- previous turn rate, used to compute delta for transient roll
-    self.PrevTurnRate   = 0
+    -- Roll state
+    self.PrevTurnRate = 0
 
     -- Initial heading
     local right   = Vector(-self.CallDir.y, self.CallDir.x, 0)
@@ -476,41 +475,36 @@ function ENT:PhysicsUpdate(phys)
     -- ============================================================
     -- COORDINATED TURN ROLL
     --
-    -- A fixed-wing aircraft rolls INTO a turn (ailerons deflect),
-    -- holds a shallow bank while the turn is steady, then returns
-    -- to wings-level as the turn rate settles.
+    -- sustained: small constant bank during steady orbit.
+    --   turnRate ~5-8 deg/s in settled orbit.
+    --   At gain 2.2: 5 deg/s -> 11 deg, 8 deg/s -> 17 deg. Visible.
     --
-    -- Two components, both negative so right-turn = right-bank:
+    -- transient: lean-in pop driven by turn-rate derivative.
+    --   Zero during steady flight; spikes on entry/exit of turn.
     --
-    --  sustained  = small constant bank proportional to current
-    --               turn rate.  Represents the established
-    --               coordinated-turn bank angle.  This is SMALL
-    --               so a constant orbit lap does not look like
-    --               a permanent lean.
+    -- Sign: turnRate positive = turning left = left wing should
+    -- drop = negative roll (Source Angle.r: positive = bank right).
+    -- So negate turnRate and delta for correct direction.
     --
-    --  transient  = driven by the CHANGE in turn rate this tick
-    --               (turn-rate derivative).  This gives the
-    --               visible 'lean in' at turn entry and 'wings
-    --               rocking level' at turn exit.  It decays
-    --               automatically because once turn rate is
-    --               steady the delta is zero.
-    --
-    -- Sign convention: positive roll = left wing down (Source
-    -- engine Angle.r positive = bank right from pilot POV).
-    -- turnRate positive = turning left.  So -sign is correct.
+    -- Lerp: banking IN  -> use fast lerp (ROLL_LERP_IN)
+    --       returning OUT -> use slow lerp (ROLL_LERP_OUT)
+    -- Direction test: if rollTarget and SmoothedRoll have the
+    -- same sign AND abs(rollTarget) > abs(SmoothedRoll) we are
+    -- still building bank -> fast.  Otherwise -> slow.
     -- ============================================================
-    local turnRateDelta = turnRate - (self.PrevTurnRate or turnRate)
+    local turnRateDelta = turnRate - self.PrevTurnRate
     self.PrevTurnRate   = turnRate
 
-    local sustained  = math.Clamp(-turnRate      * ROLL_SUSTAINED_GAIN, -12, 12)
-    local transient  = math.Clamp(-turnRateDelta * ROLL_TRANSIENT_GAIN, -10, 10)
+    local sustained  = math.Clamp(-turnRate      * ROLL_SUSTAINED_GAIN, -20, 20)
+    local transient  = math.Clamp(-turnRateDelta * ROLL_TRANSIENT_GAIN, -12, 12)
     local rollTarget = math.Clamp(sustained + transient, -ROLL_MAX, ROLL_MAX)
 
-    -- Lerp faster when banking in, slower when returning to wings-level.
-    -- This asymmetry is what makes transport aircraft look correct:
-    -- they commit to the bank promptly and ease back out lazily.
-    local lerpRate   = (math.abs(rollTarget) > math.abs(self.SmoothedRoll))
-                       and ROLL_LERP_IN or ROLL_LERP_OUT
+    -- Are we still building toward rollTarget, or returning to zero?
+    -- "Building" = target and current share sign AND target is larger.
+    local building = (rollTarget * self.SmoothedRoll >= 0)
+                     and (math.abs(rollTarget) > math.abs(self.SmoothedRoll))
+    local lerpRate = building and ROLL_LERP_IN or ROLL_LERP_OUT
+
     self.SmoothedRoll = Lerp(lerpRate, self.SmoothedRoll, rollTarget)
 
     -- ---- Pitch ----
