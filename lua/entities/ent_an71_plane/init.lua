@@ -57,6 +57,46 @@ end
 util.AddNetworkString("bombin_plane_damage_tier")
 
 -- ============================================================
+-- WORLD BOUNDARY PROBE
+-- Fires 8 radial traces at sky height from centerPos to find the
+-- shortest safe distance to a world wall.  Returns a radius cap
+-- that keeps the entire orbit circle inside the BSP.
+-- ============================================================
+local PROBE_DIRS = {}
+for i = 0, 7 do
+    local a = math.rad(i * 45)
+    PROBE_DIRS[i+1] = Vector(math.cos(a), math.sin(a), 0)
+end
+
+local PROBE_DIST = 8192  -- max BSP half-extent we care about
+local PROBE_MARGIN = 300 -- stay this far inside the nearest wall
+
+local function ProbeOrbitRadius(centerPos, skyZ, requestedRadius)
+    local origin = Vector(centerPos.x, centerPos.y, skyZ)
+    local minDist = PROBE_DIST
+    for _, dir in ipairs(PROBE_DIRS) do
+        local tr = util.TraceLine({
+            start  = origin,
+            endpos = origin + dir * PROBE_DIST,
+            mask   = MASK_SOLID_BRUSHONLY,
+        })
+        if tr.Hit then
+            local d = (tr.HitPos - origin):Length2D()
+            if d < minDist then minDist = d end
+        end
+    end
+    -- Safe radius = shortest wall distance minus margin, but never
+    -- larger than what was requested.
+    local safe = math.max(200, minDist - PROBE_MARGIN)
+    if safe < requestedRadius then
+        -- Print only when we actually had to reduce it
+        print(string.format("[AN-71] OrbitRadius capped %d -> %d (nearest wall %.0f HU)",
+            requestedRadius, safe, minDist))
+    end
+    return math.min(requestedRadius, safe)
+end
+
+-- ============================================================
 -- INITIALIZE
 -- ============================================================
 function ENT:Initialize()
@@ -75,12 +115,16 @@ function ENT:Initialize()
     local ground = self:FindGround(self.CenterPos)
     if ground == -1 then self:Debug("FindGround failed") self:Remove() return end
 
-    self.sky           = ground + self.SkyHeightAdd
+    self.sky = ground + self.SkyHeightAdd
     self.DieTime       = CurTime() + self.Lifetime
     self.SpawnTime     = CurTime()
     self.NextAlertTime = CurTime()
     self.IsDestroyed   = false
     self.DamageTier    = 0
+
+    -- Clamp orbit radius so the circle cannot leave world bounds.
+    -- This is the primary fix for the out-of-world noclip bug.
+    self.OrbitRadius = ProbeOrbitRadius(self.CenterPos, self.sky, self.OrbitRadius)
 
     -- Tumble
     self.IsTumbling        = false
@@ -91,16 +135,11 @@ function ENT:Initialize()
     self.TumbleAngVelocity = Vector(0,0,0)
 
     -- Orbit
-    -- OrbitDirection: +1 = CW from above, -1 = CCW.
     self.OrbitDirection = (math.random(2) == 1) and 1 or -1
-    -- RadialGain blends tangent vs inward pull. 0.5 = equal weight.
     self.RadialGain     = 0.5
-    -- MaxTurnRate deg/s. For R=3000, S=300 the minimum is ~5.7 deg/s.
-    -- 28 gives natural-looking banked turns without snap.
     self.MaxTurnRate    = 28
 
-    -- Compute initial heading as the tangent to the orbit circle at spawn.
-    -- right = 90-deg CCW rotation of CallDir (flat)
+    -- Initial heading = orbit tangent at spawn
     local right   = Vector(-self.CallDir.y, self.CallDir.x, 0)
     local tangent = Vector(right.x * self.OrbitDirection,
                            right.y * self.OrbitDirection, 0)
@@ -117,7 +156,7 @@ function ENT:Initialize()
         spawnPos = Vector(self.CenterPos.x, self.CenterPos.y, self.sky)
     end
     if not util.IsInWorld(spawnPos) then
-        self:Debug("Spawn position out of world") self:Remove() return
+        self:Debug("Spawn position out of world after fallback") self:Remove() return
     end
 
     self:SetModel(self.ModelPath)
@@ -130,8 +169,7 @@ function ENT:Initialize()
     self:SetRenderMode(RENDERMODE_TRANSALPHA)
     self:SetColor(Color(255, 255, 255, 0))
 
-    -- flightYaw: the single source of truth for heading.
-    -- It is an accumulator - nothing ever snaps it to a computed angle.
+    -- flightYaw: pure accumulator. Nothing ever snaps it to a computed angle.
     self.flightYaw     = tangent:Angle().y
     self.PrevFlightYaw = self.flightYaw
     self.ang           = Angle(0, self.flightYaw + MODEL_YAW_OFFSET, 0)
@@ -187,7 +225,7 @@ function ENT:Initialize()
         self.PassSoundB:Play()
     end
 
-    self:Debug("Spawned at " .. tostring(spawnPos))
+    self:Debug(string.format("Spawned at %s | OrbitRadius=%.0f", tostring(spawnPos), self.OrbitRadius))
 end
 
 -- ============================================================
@@ -374,53 +412,35 @@ function ENT:PhysicsUpdate(phys)
         self.sky
     )
 
-    -- ---- Orbit steering via cross-product turn rate ----
+    -- ---- Cross-product turn rate controller ----
     --
-    -- DESIGN: we never compute a "target yaw angle" and never call
-    -- Vector:Angle().y on a desired-direction vector.  That operation is
-    -- discontinuous at the +/-180 wrap and causes all heading snaps.
-    --
-    -- Instead we compute a SIGNED TURN RATE (deg/s) each tick:
-    --   1. current forward unit vector fwd2 (flat XY)
-    --   2. desired direction unit vector desired2 (flat XY)
-    --   3. cross = fwd2.x * desired2.y - fwd2.y * desired2.x
-    --      cross > 0 -> desired is to the LEFT  of current heading
-    --      cross < 0 -> desired is to the RIGHT of current heading
-    --   4. turnRate = cross * MaxTurnRate   (already proportional)
-    --   5. clamp to [-MaxTurnRate, MaxTurnRate] * dt and add to flightYaw
-    --
-    -- flightYaw is a pure unbounded accumulator. It never jumps.
+    -- We never compute a target yaw angle. We compute a signed turn rate
+    -- (deg/s) from the 2D cross product of current vs desired direction.
+    -- flightYaw is a pure unbounded accumulator -- it never snaps.
 
     local flatPos    = Vector(pos.x, pos.y, 0)
     local flatCenter = Vector(self.CenterPos.x, self.CenterPos.y, 0)
     local toCenter   = flatCenter - flatPos
     local dist       = toCenter:Length()
 
-    -- radialDir: unit vector pointing from the plane toward the center.
     local radialDir = (dist > 1) and (toCenter / dist) or Vector(0,0,0)
 
-    -- tangentDir: the direction the plane should fly to stay on the circle.
-    -- Perpendicular to radialDir, in OrbitDirection.
     local tangentDir = Vector(
         -radialDir.y * self.OrbitDirection,
          radialDir.x * self.OrbitDirection,
         0
     )
     if tangentDir:LengthSqr() < 0.001 then
-        -- Exactly at center: keep current heading
-        local fwdFallback = Angle(0, self.flightYaw, 0):Forward()
-        tangentDir = Vector(fwdFallback.x, fwdFallback.y, 0)
+        local fwdFb = Angle(0, self.flightYaw, 0):Forward()
+        tangentDir = Vector(fwdFb.x, fwdFb.y, 0)
     end
     tangentDir:Normalize()
 
-    -- radialError: +1 when far outside, -1 when far inside.
-    -- Blends inward pull when outside the orbit radius.
     local radialError = 0
     if self.OrbitRadius > 0 then
         radialError = math.Clamp((dist - self.OrbitRadius) / self.OrbitRadius, -1, 1)
     end
 
-    -- desired2: normalised flat desired-travel direction.
     local desired2 = Vector(
         tangentDir.x + radialDir.x * radialError * self.RadialGain,
         tangentDir.y + radialDir.y * radialError * self.RadialGain,
@@ -429,42 +449,28 @@ function ENT:PhysicsUpdate(phys)
     if desired2:LengthSqr() < 0.001 then desired2 = tangentDir end
     desired2:Normalize()
 
-    -- fwd2: current flat forward unit vector derived from flightYaw.
-    -- This is the ONLY place flightYaw is converted to a vector.
     local fwdAngle = Angle(0, self.flightYaw, 0)
     local fwd3     = fwdAngle:Forward()
     local fwd2     = Vector(fwd3.x, fwd3.y, 0)
     fwd2:Normalize()
 
-    -- 2D cross product: positive = desired is left of fwd, negative = right.
-    local cross = fwd2.x * desired2.y - fwd2.y * desired2.x
+    local cross   = fwd2.x * desired2.y - fwd2.y * desired2.x
+    local dot     = fwd2.x * desired2.x + fwd2.y * desired2.y
+    local urgency = (1 - dot) * 0.5
+    local turnRate = math.Clamp(cross * urgency * self.MaxTurnRate * 2,
+                                -self.MaxTurnRate, self.MaxTurnRate)
 
-    -- dot product: how aligned we already are (1 = perfect, -1 = opposite).
-    -- When dot is near 1 we barely need to turn; this makes the turn rate
-    -- proportional to the heading error, giving smooth approach to the circle.
-    local dot       = fwd2.x * desired2.x + fwd2.y * desired2.y
-    -- Map dot [-1,1] to urgency [1, 0]: full rate when opposite, zero when aligned.
-    local urgency   = (1 - dot) * 0.5  -- 0 when aligned, 1 when opposite
-
-    -- turnRate in deg/s: sign from cross, magnitude from urgency * MaxTurnRate.
-    local turnRate  = cross * urgency * self.MaxTurnRate * 2
-    -- Hard cap so we never spin faster than MaxTurnRate regardless of error.
-    turnRate = math.Clamp(turnRate, -self.MaxTurnRate, self.MaxTurnRate)
-
-    -- Accumulate. No snap. No discontinuity.
     self.flightYaw = self.flightYaw + turnRate * dt
 
-    -- ---- Visual roll driven by turn rate (deg/s), not per-tick delta ----
+    -- ---- Visual roll and pitch ----
     local targetRoll   = math.Clamp(turnRate * -0.55, -20, 20)
     local rollLerp     = (math.abs(turnRate) > 0.3) and 0.06 or 0.02
     self.SmoothedRoll  = Lerp(rollLerp, self.SmoothedRoll, targetRoll)
 
-    -- ---- Pitch driven by climb demand ----
     local climbDelta   = math.Clamp((liveAlt - pos.z) / 400, -1, 1)
     local targetPitch  = math.Clamp(climbDelta * 6, -8, 8)
     self.SmoothedPitch = Lerp(0.03, self.SmoothedPitch, targetPitch)
 
-    -- ---- Rebuild angle from accumulated flightYaw ----
     self.ang = Angle(
         self.SmoothedPitch,
         self.flightYaw + MODEL_YAW_OFFSET,
@@ -472,25 +478,33 @@ function ENT:PhysicsUpdate(phys)
     )
 
     -- ---- Position integration ----
-    local fwdDir = fwdAngle:Forward()  -- reuse, already computed
+    local fwdDir = fwdAngle:Forward()
     local newPos = pos + fwdDir * self.Speed * dt
     newPos.z     = Lerp(0.07, pos.z, liveAlt)
 
-    -- Safety: if next position is out of world, steer toward center for one
-    -- tick by directly biasing the desired direction.  No teleport.
+    -- ================================================================
+    -- HARD WORLD-BOUNDS GUARD
+    -- If the computed next position is outside the BSP, DO NOT move.
+    -- Hold the current position and steer hard toward CenterPos.
+    -- This is the final backstop: with ProbeOrbitRadius capping the
+    -- radius at spawn, this should never fire in normal play.
+    -- ================================================================
     if not util.IsInWorld(newPos) then
-        self:Debug("Out-of-world safety (orbit should prevent this)")
-        local safeDir = flatCenter - Vector(pos.x, pos.y, 0)
-        safeDir.z = 0
-        if safeDir:LengthSqr() < 0.001 then safeDir = Vector(-fwd2.x, -fwd2.y, 0) end
-        safeDir:Normalize()
-        -- Drive flightYaw toward safeDir with full turn rate for this one tick
-        local sCross = fwd2.x * safeDir.y - fwd2.y * safeDir.x
-        self.flightYaw = self.flightYaw + math.Clamp(sCross * self.MaxTurnRate, -self.MaxTurnRate, self.MaxTurnRate) * dt
-        local safeFwdAngle = Angle(0, self.flightYaw, 0)
-        newPos = pos + safeFwdAngle:Forward() * self.Speed * dt
-        newPos.z = liveAlt
-        self.ang = Angle(self.SmoothedPitch, self.flightYaw + MODEL_YAW_OFFSET, self.SmoothedRoll)
+        self:Debug("OOB guard fired -- steering to center")
+        -- Steer toward center with full turn authority this tick
+        local toC = flatCenter - Vector(pos.x, pos.y, 0)
+        toC.z = 0
+        if toC:LengthSqr() < 0.001 then
+            toC = Vector(-fwd2.x, -fwd2.y, 0)
+        end
+        toC:Normalize()
+        local sCross = fwd2.x * toC.y - fwd2.y * toC.x
+        self.flightYaw = self.flightYaw
+            + math.Clamp(sCross * self.MaxTurnRate, -self.MaxTurnRate, self.MaxTurnRate) * dt
+        -- Do NOT advance position this tick: stay at pos
+        self:SetPos(pos)
+        self:SetAngles(Angle(self.SmoothedPitch, self.flightYaw + MODEL_YAW_OFFSET, self.SmoothedRoll))
+        return
     end
 
     self:SetPos(newPos)
