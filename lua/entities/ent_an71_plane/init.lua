@@ -9,6 +9,29 @@ local PASS_SOUND_B = "jet/luxor/external.wav"
 -- MODEL_YAW_OFFSET: always added on top of flightYaw. Never touch this.
 local MODEL_YAW_OFFSET = 180
 
+-- ============================================================
+-- ROLL CONSTANTS
+-- Tuned for a large turboprop transport (AN-71 class).
+--
+-- SUSTAINED: degrees of bank per deg/s of steady turn rate.
+--   At MaxTurnRate=28 deg/s this gives 28*0.28 = ~8 deg of
+--   coordinated bank during the orbit -- visible but gentle.
+--   A real transport banks 15-25 deg in a standard-rate turn;
+--   8 deg reads as a shallow orbit pass.
+--
+-- TRANSIENT: degrees of roll per unit of turn-rate-delta per tick.
+--   This drives the 'lean-in' pop as the plane enters or exits
+--   a turn.  Only visible for a second or two; then decays.
+--
+-- MAX_ROLL: hard clamp.  18 deg looks convincing without making
+--   the plane appear to be in a steep bank.
+-- ============================================================
+local ROLL_SUSTAINED_GAIN = 0.28   -- deg bank / (deg/s turn rate)
+local ROLL_TRANSIENT_GAIN = 18.0   -- deg bank / (delta deg/s per tick)
+local ROLL_MAX            = 18.0   -- absolute clamp, degrees
+local ROLL_LERP_IN        = 0.055  -- approach speed when banking in
+local ROLL_LERP_OUT       = 0.018  -- return speed when levelling out
+
 function ENT:Debug(msg)
     print("[AN-71 ENT] " .. msg)
 end
@@ -58,21 +81,17 @@ util.AddNetworkString("bombin_plane_damage_tier")
 
 -- ============================================================
 -- WORLD BOUNDARY PROBE
--- Fires 8 radial traces at sky height from centerPos to find the
--- shortest safe distance to a world wall.  Returns a radius cap
--- that keeps the entire orbit circle inside the BSP.
 -- ============================================================
 local PROBE_DIRS = {}
 for i = 0, 7 do
     local a = math.rad(i * 45)
     PROBE_DIRS[i+1] = Vector(math.cos(a), math.sin(a), 0)
 end
-
-local PROBE_DIST = 8192  -- max BSP half-extent we care about
-local PROBE_MARGIN = 300 -- stay this far inside the nearest wall
+local PROBE_DIST   = 8192
+local PROBE_MARGIN = 300
 
 local function ProbeOrbitRadius(centerPos, skyZ, requestedRadius)
-    local origin = Vector(centerPos.x, centerPos.y, skyZ)
+    local origin  = Vector(centerPos.x, centerPos.y, skyZ)
     local minDist = PROBE_DIST
     for _, dir in ipairs(PROBE_DIRS) do
         local tr = util.TraceLine({
@@ -85,11 +104,8 @@ local function ProbeOrbitRadius(centerPos, skyZ, requestedRadius)
             if d < minDist then minDist = d end
         end
     end
-    -- Safe radius = shortest wall distance minus margin, but never
-    -- larger than what was requested.
     local safe = math.max(200, minDist - PROBE_MARGIN)
     if safe < requestedRadius then
-        -- Print only when we actually had to reduce it
         print(string.format("[AN-71] OrbitRadius capped %d -> %d (nearest wall %.0f HU)",
             requestedRadius, safe, minDist))
     end
@@ -115,15 +131,13 @@ function ENT:Initialize()
     local ground = self:FindGround(self.CenterPos)
     if ground == -1 then self:Debug("FindGround failed") self:Remove() return end
 
-    self.sky = ground + self.SkyHeightAdd
+    self.sky           = ground + self.SkyHeightAdd
     self.DieTime       = CurTime() + self.Lifetime
     self.SpawnTime     = CurTime()
     self.NextAlertTime = CurTime()
     self.IsDestroyed   = false
     self.DamageTier    = 0
 
-    -- Clamp orbit radius so the circle cannot leave world bounds.
-    -- This is the primary fix for the out-of-world noclip bug.
     self.OrbitRadius = ProbeOrbitRadius(self.CenterPos, self.sky, self.OrbitRadius)
 
     -- Tumble
@@ -139,7 +153,10 @@ function ENT:Initialize()
     self.RadialGain     = 0.5
     self.MaxTurnRate    = 28
 
-    -- Initial heading = orbit tangent at spawn
+    -- Roll state -- previous turn rate, used to compute delta for transient roll
+    self.PrevTurnRate   = 0
+
+    -- Initial heading
     local right   = Vector(-self.CallDir.y, self.CallDir.x, 0)
     local tangent = Vector(right.x * self.OrbitDirection,
                            right.y * self.OrbitDirection, 0)
@@ -169,7 +186,6 @@ function ENT:Initialize()
     self:SetRenderMode(RENDERMODE_TRANSALPHA)
     self:SetColor(Color(255, 255, 255, 0))
 
-    -- flightYaw: pure accumulator. Nothing ever snaps it to a computed angle.
     self.flightYaw     = tangent:Angle().y
     self.PrevFlightYaw = self.flightYaw
     self.ang           = Angle(0, self.flightYaw + MODEL_YAW_OFFSET, 0)
@@ -413,11 +429,6 @@ function ENT:PhysicsUpdate(phys)
     )
 
     -- ---- Cross-product turn rate controller ----
-    --
-    -- We never compute a target yaw angle. We compute a signed turn rate
-    -- (deg/s) from the 2D cross product of current vs desired direction.
-    -- flightYaw is a pure unbounded accumulator -- it never snaps.
-
     local flatPos    = Vector(pos.x, pos.y, 0)
     local flatCenter = Vector(self.CenterPos.x, self.CenterPos.y, 0)
     local toCenter   = flatCenter - flatPos
@@ -454,19 +465,55 @@ function ENT:PhysicsUpdate(phys)
     local fwd2     = Vector(fwd3.x, fwd3.y, 0)
     fwd2:Normalize()
 
-    local cross   = fwd2.x * desired2.y - fwd2.y * desired2.x
-    local dot     = fwd2.x * desired2.x + fwd2.y * desired2.y
-    local urgency = (1 - dot) * 0.5
+    local cross    = fwd2.x * desired2.y - fwd2.y * desired2.x
+    local dot      = fwd2.x * desired2.x + fwd2.y * desired2.y
+    local urgency  = (1 - dot) * 0.5
     local turnRate = math.Clamp(cross * urgency * self.MaxTurnRate * 2,
                                 -self.MaxTurnRate, self.MaxTurnRate)
 
     self.flightYaw = self.flightYaw + turnRate * dt
 
-    -- ---- Visual roll and pitch ----
-    local targetRoll   = math.Clamp(turnRate * -0.55, -20, 20)
-    local rollLerp     = (math.abs(turnRate) > 0.3) and 0.06 or 0.02
-    self.SmoothedRoll  = Lerp(rollLerp, self.SmoothedRoll, targetRoll)
+    -- ============================================================
+    -- COORDINATED TURN ROLL
+    --
+    -- A fixed-wing aircraft rolls INTO a turn (ailerons deflect),
+    -- holds a shallow bank while the turn is steady, then returns
+    -- to wings-level as the turn rate settles.
+    --
+    -- Two components, both negative so right-turn = right-bank:
+    --
+    --  sustained  = small constant bank proportional to current
+    --               turn rate.  Represents the established
+    --               coordinated-turn bank angle.  This is SMALL
+    --               so a constant orbit lap does not look like
+    --               a permanent lean.
+    --
+    --  transient  = driven by the CHANGE in turn rate this tick
+    --               (turn-rate derivative).  This gives the
+    --               visible 'lean in' at turn entry and 'wings
+    --               rocking level' at turn exit.  It decays
+    --               automatically because once turn rate is
+    --               steady the delta is zero.
+    --
+    -- Sign convention: positive roll = left wing down (Source
+    -- engine Angle.r positive = bank right from pilot POV).
+    -- turnRate positive = turning left.  So -sign is correct.
+    -- ============================================================
+    local turnRateDelta = turnRate - (self.PrevTurnRate or turnRate)
+    self.PrevTurnRate   = turnRate
 
+    local sustained  = math.Clamp(-turnRate      * ROLL_SUSTAINED_GAIN, -12, 12)
+    local transient  = math.Clamp(-turnRateDelta * ROLL_TRANSIENT_GAIN, -10, 10)
+    local rollTarget = math.Clamp(sustained + transient, -ROLL_MAX, ROLL_MAX)
+
+    -- Lerp faster when banking in, slower when returning to wings-level.
+    -- This asymmetry is what makes transport aircraft look correct:
+    -- they commit to the bank promptly and ease back out lazily.
+    local lerpRate   = (math.abs(rollTarget) > math.abs(self.SmoothedRoll))
+                       and ROLL_LERP_IN or ROLL_LERP_OUT
+    self.SmoothedRoll = Lerp(lerpRate, self.SmoothedRoll, rollTarget)
+
+    -- ---- Pitch ----
     local climbDelta   = math.Clamp((liveAlt - pos.z) / 400, -1, 1)
     local targetPitch  = math.Clamp(climbDelta * 6, -8, 8)
     self.SmoothedPitch = Lerp(0.03, self.SmoothedPitch, targetPitch)
@@ -482,26 +529,16 @@ function ENT:PhysicsUpdate(phys)
     local newPos = pos + fwdDir * self.Speed * dt
     newPos.z     = Lerp(0.07, pos.z, liveAlt)
 
-    -- ================================================================
-    -- HARD WORLD-BOUNDS GUARD
-    -- If the computed next position is outside the BSP, DO NOT move.
-    -- Hold the current position and steer hard toward CenterPos.
-    -- This is the final backstop: with ProbeOrbitRadius capping the
-    -- radius at spawn, this should never fire in normal play.
-    -- ================================================================
+    -- ---- Hard world-bounds guard ----
     if not util.IsInWorld(newPos) then
         self:Debug("OOB guard fired -- steering to center")
-        -- Steer toward center with full turn authority this tick
         local toC = flatCenter - Vector(pos.x, pos.y, 0)
         toC.z = 0
-        if toC:LengthSqr() < 0.001 then
-            toC = Vector(-fwd2.x, -fwd2.y, 0)
-        end
+        if toC:LengthSqr() < 0.001 then toC = Vector(-fwd2.x, -fwd2.y, 0) end
         toC:Normalize()
         local sCross = fwd2.x * toC.y - fwd2.y * toC.x
         self.flightYaw = self.flightYaw
             + math.Clamp(sCross * self.MaxTurnRate, -self.MaxTurnRate, self.MaxTurnRate) * dt
-        -- Do NOT advance position this tick: stay at pos
         self:SetPos(pos)
         self:SetAngles(Angle(self.SmoothedPitch, self.flightYaw + MODEL_YAW_OFFSET, self.SmoothedRoll))
         return
