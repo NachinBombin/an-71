@@ -278,11 +278,9 @@ end
 
 -- ============================================================
 -- GIB SPAWNER
--- Gibs are staggered 0.1s apart so physics init is spread across
--- multiple ticks -- eliminates the lag spike from bulk spawning.
--- COLLISION_GROUP_DEBRIS means gibs collide with the world but
--- NOT with each other, so no inter-gib explosions on contact.
--- Ignite is called immediately after Activate -- no deferred timers.
+-- Each gib is staggered 0.1s apart to avoid a bulk-spawn lag spike.
+-- Ignite is deferred one tick (timer.Simple(0)) after Activate so
+-- the entity fire system is fully ready -- this is the reliable pattern.
 -- ============================================================
 local GIB_MODELS = {
     "models/xqm/jetbody2tailpiecelarge.mdl",
@@ -316,7 +314,6 @@ local function SpawnGibs(origin)
             gib:SetCollisionGroup(COLLISION_GROUP_DEBRIS)
             gib:Spawn()
             gib:Activate()
-            gib:Ignite(GIB_LIFETIME, 0)
 
             local phys = gib:GetPhysicsObject()
             if IsValid(phys) then
@@ -336,6 +333,13 @@ local function SpawnGibs(origin)
                     math.Rand(-2000, 2000)
                 ))
             end
+
+            -- Defer Ignite one tick so the entity fire system is ready
+            timer.Simple(0, function()
+                if IsValid(gib) then
+                    gib:Ignite(GIB_LIFETIME, 0)
+                end
+            end)
 
             timer.Simple(GIB_LIFETIME, function()
                 if IsValid(gib) then gib:Remove() end
