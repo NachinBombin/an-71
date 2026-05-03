@@ -304,10 +304,88 @@ function ENT:StartTumble()
     sound.Play("ambient/explosions/explode_4.wav", pos, 135, 95, 1.0)
 end
 
+-- ============================================================
+-- GIB SPAWNER
+-- Spawns burning debris pieces at the crash site.
+-- Each gib is a physics prop, ignited immediately, removed after 40s.
+-- ============================================================
+local GIB_MODELS = {
+    -- tail
+    { mdl = "models/xqm/jetbody2tailpiecelarge.mdl",  count = 1 },
+    -- fuselage (two different sizes)
+    { mdl = "models/xqm/jetbody2fuselagehuge.mdl",    count = 1 },
+    { mdl = "models/xqm/jetbody2fuselagelarge.mdl",   count = 1 },
+    -- wings
+    { mdl = "models/xqm/jetwing2sizable.mdl",          count = 1 },
+    { mdl = "models/xqm/jetbody2wingrootblarge.mdl",   count = 2 },
+    -- engines
+    { mdl = "models/xqm/jetenginehuge.mdl",            count = 2 },
+}
+
+local GIB_DESPAWN_TIME = 40  -- seconds before each gib is removed
+
+local function SpawnGibs(crashPos, crashAng)
+    for _, entry in ipairs(GIB_MODELS) do
+        for i = 1, entry.count do
+            local gib = ents.Create("prop_physics")
+            if not IsValid(gib) then continue end
+
+            -- Scatter each piece around the crash point
+            local scatter = Vector(
+                math.Rand(-200, 200),
+                math.Rand(-200, 200),
+                math.Rand(  30, 120)
+            )
+            local spawnPos = crashPos + scatter
+
+            -- Randomise initial orientation so pieces look tumbled
+            local spawnAng = Angle(
+                math.Rand(0, 360),
+                math.Rand(0, 360),
+                math.Rand(0, 360)
+            )
+
+            gib:SetModel(entry.mdl)
+            gib:SetPos(spawnPos)
+            gib:SetAngles(spawnAng)
+            gib:Spawn()
+            gib:Activate()
+
+            -- Physics impulse: toss pieces outward and upward
+            local phys = gib:GetPhysicsObject()
+            if IsValid(phys) then
+                local impulse = Vector(
+                    math.Rand(-800, 800),
+                    math.Rand(-800, 800),
+                    math.Rand( 400, 1200)
+                )
+                phys:ApplyForceCenter(impulse * phys:GetMass())
+                phys:ApplyTorqueCenter(Vector(
+                    math.Rand(-2000, 2000),
+                    math.Rand(-2000, 2000),
+                    math.Rand(-2000, 2000)
+                ))
+            end
+
+            -- Ignite the gib immediately
+            gib:Ignite(GIB_DESPAWN_TIME, 0)
+
+            -- Despawn after 40 seconds
+            local gibRef = gib  -- capture for timer closure
+            timer.Simple(GIB_DESPAWN_TIME, function()
+                if IsValid(gibRef) then
+                    gibRef:Remove()
+                end
+            end)
+        end
+    end
+end
+
 function ENT:CrashExplode()
     if self.TumbleCrashed then return end
     self.TumbleCrashed = true
     local pos = self:GetPos()
+    local ang = self:GetAngles()
     local function boom(origin, sc)
         local ed = EffectData() ed:SetOrigin(origin)
         ed:SetScale(sc) ed:SetMagnitude(sc) ed:SetRadius(sc * 100)
@@ -322,6 +400,10 @@ function ENT:CrashExplode()
     sound.Play("ambient/explosions/explode_8.wav", pos, 140, 90, 1.0)
     sound.Play("weapon_AWP.Single",                pos, 145, 60, 1.0)
     util.BlastDamage(self, self, pos, 400, 200)
+
+    -- Spawn gib pieces before removing the plane model
+    SpawnGibs(pos, ang)
+
     self:Remove()
 end
 
