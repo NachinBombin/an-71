@@ -471,13 +471,16 @@ function ENT:Think()
     if not IsValid(self.PhysObj) then self.PhysObj = self:GetPhysicsObject() end
     if IsValid(self.PhysObj) and self.PhysObj:IsAsleep() then self.PhysObj:Wake() end
     if ct >= self.NextAlertTime then
-        local npcs = ents.FindByClass("npc_*")
         local plys = player.GetAll()
-        for _, npc in ipairs(npcs) do
-            if not IsValid(npc) then continue end
+        for _, ent in ipairs(ents.GetAll()) do
+            -- ents.FindByClass("npc_*") does not support wildcards in GMod;
+            -- iterate all and check IsNPC() + capability guard.
+            if not IsValid(ent) then continue end
+            if not ent:IsNPC() then continue end
+            if not ent.UpdateEnemyMemory then continue end
             for _, ply in ipairs(plys) do
                 if IsValid(ply) and ply:Alive() then
-                    npc:UpdateEnemyMemory(ply, ply:GetPos())
+                    ent:UpdateEnemyMemory(ply, ply:GetPos())
                 end
             end
         end
