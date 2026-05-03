@@ -11,25 +11,12 @@ local MODEL_YAW_OFFSET = 180
 
 -- ============================================================
 -- ROLL CONSTANTS
--- AN-71 class turboprop transport.
---
--- At a settled orbit turnRate is roughly 5-8 deg/s.
--- ROLL_SUSTAINED_GAIN = 2.2 gives:
---   5 deg/s  -> 11 deg bank  (gentle pass)
---   8 deg/s  -> 17 deg bank  (tighter correction)
---   28 deg/s -> capped at ROLL_MAX (never reached in normal orbit)
---
--- ROLL_TRANSIENT_GAIN drives the lean-in pop at turn entry/exit.
--- It acts on the PER-TICK delta of turnRate so it is automatically
--- zero during steady flight and spikes only when turn rate changes.
---
--- ROLL_MAX = 25 deg -- heavy transport, not a fighter.
 -- ============================================================
-local ROLL_SUSTAINED_GAIN = 2.2    -- deg bank per (deg/s) turn rate
-local ROLL_TRANSIENT_GAIN = 55.0   -- deg bank per (deg/s change per tick)
-local ROLL_MAX            = 25.0   -- hard clamp, degrees
-local ROLL_LERP_IN        = 0.08   -- lean-in speed (brisk)
-local ROLL_LERP_OUT       = 0.012  -- return-to-level speed (lazy)
+local ROLL_SUSTAINED_GAIN = 2.2
+local ROLL_TRANSIENT_GAIN = 55.0
+local ROLL_MAX            = 25.0
+local ROLL_LERP_IN        = 0.08
+local ROLL_LERP_OUT       = 0.012
 
 function ENT:Debug(msg)
     print("[AN-71 ENT] " .. msg)
@@ -307,22 +294,21 @@ end
 -- ============================================================
 -- GIB SPAWNER
 -- Spawns burning debris pieces at the crash site.
--- Each gib is a physics prop, ignited immediately, removed after 40s.
+-- Each gib: zero drag, 2000 mass, gravity on -> falls fast like metal.
+-- Ignited guaranteed via timer.Simple(0) after full entity init.
+-- Auto-removed after 40s.
 -- ============================================================
 local GIB_MODELS = {
-    -- tail
     { mdl = "models/xqm/jetbody2tailpiecelarge.mdl",  count = 1 },
-    -- fuselage (two different sizes)
     { mdl = "models/xqm/jetbody2fuselagehuge.mdl",    count = 1 },
     { mdl = "models/xqm/jetbody2fuselagelarge.mdl",   count = 1 },
-    -- wings
-    { mdl = "models/xqm/jetwing2sizable.mdl",          count = 1 },
-    { mdl = "models/xqm/jetbody2wingrootblarge.mdl",   count = 2 },
-    -- engines
-    { mdl = "models/xqm/jetenginehuge.mdl",            count = 2 },
+    { mdl = "models/xqm/jetwing2sizable.mdl",         count = 1 },
+    { mdl = "models/xqm/jetbody2wingrootblarge.mdl",  count = 2 },
+    { mdl = "models/xqm/jetenginehuge.mdl",           count = 2 },
 }
 
-local GIB_DESPAWN_TIME = 40  -- seconds before each gib is removed
+local GIB_DESPAWN_TIME = 40
+local GIB_MASS         = 2000   -- kg equivalent; heavy metal -> fast fall
 
 local function SpawnGibs(crashPos, crashAng)
     for _, entry in ipairs(GIB_MODELS) do
@@ -330,15 +316,12 @@ local function SpawnGibs(crashPos, crashAng)
             local gib = ents.Create("prop_physics")
             if not IsValid(gib) then continue end
 
-            -- Scatter each piece around the crash point
             local scatter = Vector(
                 math.Rand(-200, 200),
                 math.Rand(-200, 200),
                 math.Rand(  30, 120)
             )
             local spawnPos = crashPos + scatter
-
-            -- Randomise initial orientation so pieces look tumbled
             local spawnAng = Angle(
                 math.Rand(0, 360),
                 math.Rand(0, 360),
@@ -351,27 +334,37 @@ local function SpawnGibs(crashPos, crashAng)
             gib:Spawn()
             gib:Activate()
 
-            -- Physics impulse: toss pieces outward and upward
             local phys = gib:GetPhysicsObject()
             if IsValid(phys) then
-                local impulse = Vector(
-                    math.Rand(-800, 800),
-                    math.Rand(-800, 800),
-                    math.Rand( 400, 1200)
-                )
-                phys:ApplyForceCenter(impulse * phys:GetMass())
+                -- Kill all drag so Source's air resistance doesn't float them
+                phys:SetDragCoefficient(0)
+                phys:SetAngleDragCoefficient(0)
+                -- Heavy mass -> gravity dominates, pieces fall fast
+                phys:SetMass(GIB_MASS)
+                phys:EnableGravity(true)
+                phys:Wake()
+                -- Outward explosive impulse (already mass-scaled by * GIB_MASS)
+                phys:ApplyForceCenter(Vector(
+                    math.Rand(-600, 600),
+                    math.Rand(-600, 600),
+                    math.Rand( 500, 1400)
+                ) * GIB_MASS)
                 phys:ApplyTorqueCenter(Vector(
-                    math.Rand(-2000, 2000),
-                    math.Rand(-2000, 2000),
-                    math.Rand(-2000, 2000)
+                    math.Rand(-3000, 3000),
+                    math.Rand(-3000, 3000),
+                    math.Rand(-3000, 3000)
                 ))
             end
 
-            -- Ignite the gib immediately
-            gib:Ignite(GIB_DESPAWN_TIME, 0)
+            -- Defer ignition by one tick so the entity is fully settled;
+            -- this guarantees every piece is on fire, no exceptions.
+            local gibRef = gib
+            timer.Simple(0, function()
+                if IsValid(gibRef) then
+                    gibRef:Ignite(GIB_DESPAWN_TIME, 0)
+                end
+            end)
 
-            -- Despawn after 40 seconds
-            local gibRef = gib  -- capture for timer closure
             timer.Simple(GIB_DESPAWN_TIME, function()
                 if IsValid(gibRef) then
                     gibRef:Remove()
@@ -401,7 +394,6 @@ function ENT:CrashExplode()
     sound.Play("weapon_AWP.Single",                pos, 145, 60, 1.0)
     util.BlastDamage(self, self, pos, 400, 200)
 
-    -- Spawn gib pieces before removing the plane model
     SpawnGibs(pos, ang)
 
     self:Remove()
@@ -468,7 +460,6 @@ end
 function ENT:PhysicsUpdate(phys)
     if not self.DieTime or not self.sky then return end
 
-    -- ---- TUMBLE PATH ----
     if self.IsTumbling then
         if self.TumbleCrashed then return end
         local dt      = engine.TickInterval()
@@ -490,13 +481,9 @@ function ENT:PhysicsUpdate(phys)
 
     if CurTime() >= self.DieTime then self:Remove() return end
 
-    -- ============================================================
-    -- NORMAL FLIGHT
-    -- ============================================================
     local pos = self:GetPos()
     local dt  = engine.TickInterval()
 
-    -- ---- Altitude ----
     if CurTime() >= self.AltDriftNextPick then
         self.AltDriftTarget   = self.sky - math.Rand(0, self.AltDriftRange)
         self.AltDriftNextPick = CurTime() + math.Rand(12, 30)
@@ -509,7 +496,6 @@ function ENT:PhysicsUpdate(phys)
         self.sky
     )
 
-    -- ---- Cross-product turn rate controller ----
     local flatPos    = Vector(pos.x, pos.y, 0)
     local flatCenter = Vector(self.CenterPos.x, self.CenterPos.y, 0)
     local toCenter   = flatCenter - flatPos
@@ -554,14 +540,6 @@ function ENT:PhysicsUpdate(phys)
 
     self.flightYaw = self.flightYaw + turnRate * dt
 
-    -- ============================================================
-    -- COORDINATED TURN ROLL
-    --
-    -- Source engine Angle.r convention on this model:
-    --   positive roll = bank INTO the turn (correct for this mesh).
-    -- turnRate positive = turning in the orbit direction.
-    -- So no negation needed -- roll follows turnRate directly.
-    -- ============================================================
     local turnRateDelta = turnRate - self.PrevTurnRate
     self.PrevTurnRate   = turnRate
 
@@ -575,7 +553,6 @@ function ENT:PhysicsUpdate(phys)
 
     self.SmoothedRoll = Lerp(lerpRate, self.SmoothedRoll, rollTarget)
 
-    -- ---- Pitch ----
     local climbDelta   = math.Clamp((liveAlt - pos.z) / 400, -1, 1)
     local targetPitch  = math.Clamp(climbDelta * 6, -8, 8)
     self.SmoothedPitch = Lerp(0.03, self.SmoothedPitch, targetPitch)
@@ -586,12 +563,10 @@ function ENT:PhysicsUpdate(phys)
         self.SmoothedRoll
     )
 
-    -- ---- Position integration ----
     local fwdDir = fwdAngle:Forward()
     local newPos = pos + fwdDir * self.Speed * dt
     newPos.z     = Lerp(0.07, pos.z, liveAlt)
 
-    -- ---- Hard world-bounds guard ----
     if not util.IsInWorld(newPos) then
         self:Debug("OOB guard fired -- steering to center")
         local toC = flatCenter - Vector(pos.x, pos.y, 0)
