@@ -292,12 +292,44 @@ function ENT:StartTumble()
 end
 
 -- ============================================================
+-- SAFE CRASH ORIGIN
+-- The plane may be partially or fully OOB when it crashes.
+-- Walk from the current position toward CenterPos in 200 HU steps
+-- until we find a point that is inside the world.
+-- Falls back to CenterPos (at crash Z) if nothing works.
+-- ============================================================
+local function FindSafeCrashOrigin(rawPos, centerPos)
+    -- Already fine
+    if util.IsInWorld(rawPos) then return rawPos end
+
+    -- Step toward the map center horizontally, keep the crash Z
+    local target = Vector(centerPos.x, centerPos.y, rawPos.z)
+    local dir    = target - rawPos
+    local dist   = dir:Length()
+    if dist < 1 then
+        -- rawPos == center; just raise Z and try
+        local raised = Vector(centerPos.x, centerPos.y, rawPos.z)
+        if util.IsInWorld(raised) then return raised end
+        return centerPos
+    end
+    dir = dir / dist
+
+    local steps = math.ceil(dist / 200)
+    for i = 1, steps do
+        local candidate = rawPos + dir * (i * 200)
+        if util.IsInWorld(candidate) then
+            return candidate
+        end
+    end
+
+    -- Last resort: map center at crash Z, then bare centerPos
+    local atCenter = Vector(centerPos.x, centerPos.y, rawPos.z)
+    if util.IsInWorld(atCenter) then return atCenter end
+    return centerPos
+end
+
+-- ============================================================
 -- GIB SPAWNER
--- Spawns burning debris pieces at the crash site.
--- Each gib: zero drag, 2000 mass, gravity on -> falls fast like metal.
--- Spawn position is validated in-world with two fallback levels.
--- Ignited guaranteed via timer.Simple(0) after full entity init.
--- Auto-removed after 40s.
 -- ============================================================
 local GIB_MODELS = {
     { mdl = "models/xqm/jetbody2tailpiecelarge.mdl",  count = 1 },
@@ -311,50 +343,23 @@ local GIB_MODELS = {
 local GIB_DESPAWN_TIME = 40
 local GIB_MASS         = 2000
 
--- Returns a safe spawn position guaranteed to be inside the world.
--- Tries the scattered position first, then falls back to crashPos (+50z).
--- Also traces DOWN from the candidate to confirm there is solid world
--- geometry below (i.e. not floating above the skybox void).
-local function SafeGibPos(crashPos, scatter)
-    local candidate = crashPos + scatter
-
-    -- Primary check: Source engine world extents
-    if not util.IsInWorld(candidate) then
-        candidate = Vector(crashPos.x, crashPos.y, crashPos.z + 50)
-    end
-
-    -- Secondary check: make sure there is world below us within 32k HU.
-    -- If there is nothing below, we are above the void / past the skybox.
-    -- In that case snap to crashPos so the gibs land at the impact point.
-    local tr = util.TraceLine({
-        start  = candidate,
-        endpos  = candidate + Vector(0, 0, -32768),
-        mask   = MASK_SOLID_BRUSHONLY,
-    })
-    if not tr.Hit then
-        candidate = Vector(crashPos.x, crashPos.y, crashPos.z + 50)
-    end
-
-    -- Final fallback: if still OOB for any reason, clamp to crashPos
-    if not util.IsInWorld(candidate) then
-        candidate = crashPos
-    end
-
-    return candidate
-end
-
-local function SpawnGibs(crashPos, crashAng)
+local function SpawnGibs(safeOrigin)
     for _, entry in ipairs(GIB_MODELS) do
         for i = 1, entry.count do
             local gib = ents.Create("prop_physics")
             if not IsValid(gib) then continue end
 
+            -- Scatter around the safe origin; validate each piece individually
             local scatter = Vector(
                 math.Rand(-200, 200),
                 math.Rand(-200, 200),
                 math.Rand(  30, 120)
             )
-            local spawnPos = SafeGibPos(crashPos, scatter)
+            local spawnPos = safeOrigin + scatter
+            if not util.IsInWorld(spawnPos) then
+                spawnPos = safeOrigin + Vector(0, 0, 50)
+            end
+
             local spawnAng = Angle(
                 math.Rand(0, 360),
                 math.Rand(0, 360),
@@ -407,22 +412,28 @@ function ENT:CrashExplode()
     self.TumbleCrashed = true
     local pos = self:GetPos()
     local ang = self:GetAngles()
+
+    -- Resolve a safe origin for effects and gibs before anything else.
+    -- If the plane crossed the world boundary during tumble the raw pos
+    -- will be OOB; walk back toward CenterPos until we're inside.
+    local safePos = FindSafeCrashOrigin(pos, self.CenterPos)
+
     local function boom(origin, sc)
         local ed = EffectData() ed:SetOrigin(origin)
         ed:SetScale(sc) ed:SetMagnitude(sc) ed:SetRadius(sc * 100)
         util.Effect("500lb_air", ed, true, true)
     end
-    local ed1 = EffectData() ed1:SetOrigin(pos)
+    local ed1 = EffectData() ed1:SetOrigin(safePos)
     ed1:SetScale(6) ed1:SetMagnitude(6) ed1:SetRadius(600)
     util.Effect("HelicopterMegaBomb", ed1, true, true)
-    boom(pos, 5)
-    boom(pos + Vector(0,0,80),  4)
-    boom(pos + Vector(0,0,180), 3)
-    sound.Play("ambient/explosions/explode_8.wav", pos, 140, 90, 1.0)
-    sound.Play("weapon_AWP.Single",                pos, 145, 60, 1.0)
-    util.BlastDamage(self, self, pos, 400, 200)
+    boom(safePos, 5)
+    boom(safePos + Vector(0,0,80),  4)
+    boom(safePos + Vector(0,0,180), 3)
+    sound.Play("ambient/explosions/explode_8.wav", safePos, 140, 90, 1.0)
+    sound.Play("weapon_AWP.Single",                safePos, 145, 60, 1.0)
+    util.BlastDamage(self, self, safePos, 400, 200)
 
-    SpawnGibs(pos, ang)
+    SpawnGibs(safePos)
 
     self:Remove()
 end
