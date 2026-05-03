@@ -6,12 +6,8 @@ include("shared.lua")
 local PASS_SOUND_A = "jet/luxor/medium.wav"
 local PASS_SOUND_B = "jet/luxor/external.wav"
 
--- MODEL_YAW_OFFSET: always added on top of flightYaw. Never touch this.
 local MODEL_YAW_OFFSET = 180
 
--- ============================================================
--- ROLL CONSTANTS
--- ============================================================
 local ROLL_SUSTAINED_GAIN = 2.2
 local ROLL_TRANSIENT_GAIN = 55.0
 local ROLL_MAX            = 25.0
@@ -22,9 +18,6 @@ function ENT:Debug(msg)
     print("[AN-71 ENT] " .. msg)
 end
 
--- ============================================================
--- NPC RELATIONSHIP HELPER
--- ============================================================
 local function SeedRelationship(npc)
     for _, ply in ipairs(player.GetAll()) do
         if IsValid(ply) then
@@ -33,13 +26,10 @@ local function SeedRelationship(npc)
     end
 end
 
--- ============================================================
--- SOUND HELPERS
--- ============================================================
 function ENT:StopAllSounds()
     if self.EngineLoop then self.EngineLoop:Stop() self.EngineLoop = nil end
-    if self.PassSoundA then self.PassSoundA:Stop() self.PassSoundA = nil end
-    if self.PassSoundB then self.PassSoundB:Stop() self.PassSoundB = nil end
+    if self.PassSoundA  then self.PassSoundA:Stop()  self.PassSoundA  = nil end
+    if self.PassSoundB  then self.PassSoundB:Stop()  self.PassSoundB  = nil end
 end
 
 function ENT:FadeAndStopSounds(fadeTime)
@@ -60,14 +50,8 @@ function ENT:FadeAndStopSounds(fadeTime)
     end)
 end
 
--- ============================================================
--- NET STRING
--- ============================================================
 util.AddNetworkString("bombin_plane_damage_tier")
 
--- ============================================================
--- WORLD BOUNDARY PROBE
--- ============================================================
 local PROBE_DIRS = {}
 for i = 0, 7 do
     local a = math.rad(i * 45)
@@ -98,9 +82,6 @@ local function ProbeOrbitRadius(centerPos, skyZ, requestedRadius)
     return math.min(requestedRadius, safe)
 end
 
--- ============================================================
--- INITIALIZE
--- ============================================================
 function ENT:Initialize()
     self.CenterPos    = self:GetVar("CenterPos",    self:GetPos())
     self.CallDir      = self:GetVar("CallDir",      Vector(1, 0, 0))
@@ -126,7 +107,6 @@ function ENT:Initialize()
 
     self.OrbitRadius = ProbeOrbitRadius(self.CenterPos, self.sky, self.OrbitRadius)
 
-    -- Tumble
     self.IsTumbling        = false
     self.TumbleStartTime   = 0
     self.TumbleGroundZ     = ground
@@ -134,15 +114,11 @@ function ENT:Initialize()
     self.TumbleVelocity    = Vector(0,0,0)
     self.TumbleAngVelocity = Vector(0,0,0)
 
-    -- Orbit
     self.OrbitDirection = (math.random(2) == 1) and 1 or -1
     self.RadialGain     = 0.5
     self.MaxTurnRate    = 28
+    self.PrevTurnRate   = 0
 
-    -- Roll state
-    self.PrevTurnRate = 0
-
-    -- Initial heading
     local right   = Vector(-self.CallDir.y, self.CallDir.x, 0)
     local tangent = Vector(right.x * self.OrbitDirection,
                            right.y * self.OrbitDirection, 0)
@@ -230,9 +206,6 @@ function ENT:Initialize()
     self:Debug(string.format("Spawned at %s | OrbitRadius=%.0f", tostring(spawnPos), self.OrbitRadius))
 end
 
--- ============================================================
--- DAMAGE TIER HELPER
--- ============================================================
 local function CalcTier(hp, maxHP)
     local frac = hp / maxHP
     if frac > 0.66 then return 0
@@ -248,9 +221,6 @@ local function BroadcastTier(ent, tier)
     net.Broadcast()
 end
 
--- ============================================================
--- DAMAGE / HP SYSTEM
--- ============================================================
 function ENT:OnTakeDamage(dmginfo)
     if self.IsDestroyed then return end
     if dmginfo:IsDamageType(DMG_CRUSH) then return end
@@ -266,9 +236,6 @@ function ENT:OnTakeDamage(dmginfo)
     if hp <= 0 then self:Debug("Shot down!") self:DestroyPlane() end
 end
 
--- ============================================================
--- TUMBLE SYSTEM
--- ============================================================
 function ENT:StartTumble()
     self.IsTumbling      = true
     self.TumbleStartTime = CurTime()
@@ -291,143 +258,104 @@ function ENT:StartTumble()
     sound.Play("ambient/explosions/explode_4.wav", pos, 135, 95, 1.0)
 end
 
--- ============================================================
--- SAFE CRASH ORIGIN
--- ============================================================
 local function FindSafeCrashOrigin(rawPos, centerPos)
     if util.IsInWorld(rawPos) then return rawPos end
-
     local target = Vector(centerPos.x, centerPos.y, rawPos.z)
     local dir    = target - rawPos
     local dist   = dir:Length()
     if dist < 1 then
-        local raised = Vector(centerPos.x, centerPos.y, rawPos.z)
-        if util.IsInWorld(raised) then return raised end
-        return centerPos
+        local c = Vector(centerPos.x, centerPos.y, rawPos.z)
+        return util.IsInWorld(c) and c or centerPos
     end
     dir = dir / dist
-
-    local steps = math.ceil(dist / 200)
-    for i = 1, steps do
-        local candidate = rawPos + dir * (i * 200)
-        if util.IsInWorld(candidate) then
-            return candidate
-        end
+    for i = 1, math.ceil(dist / 200) do
+        local c = rawPos + dir * (i * 200)
+        if util.IsInWorld(c) then return c end
     end
-
-    local atCenter = Vector(centerPos.x, centerPos.y, rawPos.z)
-    if util.IsInWorld(atCenter) then return atCenter end
-    return centerPos
+    local c = Vector(centerPos.x, centerPos.y, rawPos.z)
+    return util.IsInWorld(c) and c or centerPos
 end
 
 -- ============================================================
 -- GIB SPAWNER
+-- Gibs are staggered 0.1s apart so physics init is spread across
+-- multiple ticks -- eliminates the lag spike from bulk spawning.
+-- COLLISION_GROUP_DEBRIS means gibs collide with the world but
+-- NOT with each other, so no inter-gib explosions on contact.
+-- Ignite is called immediately after Activate -- no deferred timers.
 -- ============================================================
 local GIB_MODELS = {
-    { mdl = "models/xqm/jetbody2tailpiecelarge.mdl",  count = 1 },
-    { mdl = "models/xqm/jetbody2fuselagehuge.mdl",    count = 1 },
-    { mdl = "models/xqm/jetbody2fuselagelarge.mdl",   count = 1 },
-    { mdl = "models/xqm/jetwing2sizable.mdl",         count = 1 },
-    { mdl = "models/xqm/jetbody2wingrootblarge.mdl",  count = 2 },
-    { mdl = "models/xqm/jetenginehuge.mdl",           count = 2 },
+    "models/xqm/jetbody2tailpiecelarge.mdl",
+    "models/xqm/jetbody2fuselagehuge.mdl",
+    "models/xqm/jetbody2fuselagelarge.mdl",
+    "models/xqm/jetwing2sizable.mdl",
+    "models/xqm/jetbody2wingrootblarge.mdl",
+    "models/xqm/jetbody2wingrootblarge.mdl",
+    "models/xqm/jetenginehuge.mdl",
+    "models/xqm/jetenginehuge.mdl",
 }
 
-local GIB_DESPAWN_TIME          = 40
-local GIB_MASS                  = 2000
-local GIB_NO_COLLIDE_TIME       = 1.0
-local GIB_COLLISION_GROUP_START = COLLISION_GROUP_DEBRIS_TRIGGER
-local GIB_COLLISION_GROUP_END   = COLLISION_GROUP_DEBRIS
+local GIB_LIFETIME = 40
 
-local function SpawnGibs(safeOrigin)
-    for _, entry in ipairs(GIB_MODELS) do
-        for i = 1, entry.count do
+local function SpawnGibs(origin)
+    for idx, mdl in ipairs(GIB_MODELS) do
+        timer.Simple((idx - 1) * 0.1, function()
             local gib = ents.Create("prop_physics")
-            if not IsValid(gib) then continue end
+            if not IsValid(gib) then return end
 
-            local scatter = Vector(
-                math.Rand(-200, 200),
-                math.Rand(-200, 200),
-                math.Rand(  30, 120)
+            local pos = origin + Vector(
+                math.Rand(-150, 150),
+                math.Rand(-150, 150),
+                math.Rand(  20, 100)
             )
-            local spawnPos = safeOrigin + scatter
-            if not util.IsInWorld(spawnPos) then
-                spawnPos = safeOrigin + Vector(0, 0, 50)
-            end
+            if not util.IsInWorld(pos) then pos = origin end
 
-            local spawnAng = Angle(
-                math.Rand(0, 360),
-                math.Rand(0, 360),
-                math.Rand(0, 360)
-            )
-
-            gib:SetModel(entry.mdl)
-            gib:SetPos(spawnPos)
-            gib:SetAngles(spawnAng)
-            gib:SetCollisionGroup(GIB_COLLISION_GROUP_START)
+            gib:SetModel(mdl)
+            gib:SetPos(pos)
+            gib:SetAngles(Angle(math.Rand(0,360), math.Rand(0,360), math.Rand(0,360)))
+            gib:SetCollisionGroup(COLLISION_GROUP_DEBRIS)
             gib:Spawn()
             gib:Activate()
-            gib:SetCollisionGroup(GIB_COLLISION_GROUP_START)
+            gib:Ignite(GIB_LIFETIME, 0)
 
             local phys = gib:GetPhysicsObject()
             if IsValid(phys) then
+                phys:SetMass(2000)
                 phys:SetDragCoefficient(0)
                 phys:SetAngleDragCoefficient(0)
-                phys:SetMass(GIB_MASS)
-                phys:EnableCollisions(false)
                 phys:EnableGravity(true)
                 phys:Wake()
                 phys:ApplyForceCenter(Vector(
-                    math.Rand(-600, 600),
-                    math.Rand(-600, 600),
-                    math.Rand( 500, 1400)
-                ) * GIB_MASS)
+                    math.Rand(-400, 400),
+                    math.Rand(-400, 400),
+                    math.Rand( 300, 900)
+                ) * 2000)
                 phys:ApplyTorqueCenter(Vector(
-                    math.Rand(-3000, 3000),
-                    math.Rand(-3000, 3000),
-                    math.Rand(-3000, 3000)
+                    math.Rand(-2000, 2000),
+                    math.Rand(-2000, 2000),
+                    math.Rand(-2000, 2000)
                 ))
             end
 
-            local gibRef = gib
-            timer.Simple(0, function()
-                if IsValid(gibRef) then
-                    gibRef:Ignite(GIB_DESPAWN_TIME, 0)
-                end
+            timer.Simple(GIB_LIFETIME, function()
+                if IsValid(gib) then gib:Remove() end
             end)
-
-            timer.Simple(GIB_NO_COLLIDE_TIME, function()
-                if not IsValid(gibRef) then return end
-                gibRef:SetCollisionGroup(GIB_COLLISION_GROUP_END)
-                local gibPhys = gibRef:GetPhysicsObject()
-                if IsValid(gibPhys) then
-                    gibPhys:EnableCollisions(true)
-                    gibPhys:Wake()
-                end
-            end)
-
-            timer.Simple(GIB_DESPAWN_TIME, function()
-                if IsValid(gibRef) then
-                    gibRef:Remove()
-                end
-            end)
-        end
+        end)
     end
 end
 
 function ENT:CrashExplode()
     if self.TumbleCrashed then return end
     self.TumbleCrashed = true
-    local pos = self:GetPos()
-    local ang = self:GetAngles()
-    local safePos = FindSafeCrashOrigin(pos, self.CenterPos)
+    local safePos = FindSafeCrashOrigin(self:GetPos(), self.CenterPos)
 
     local function boom(origin, sc)
-        local ed = EffectData() ed:SetOrigin(origin)
-        ed:SetScale(sc) ed:SetMagnitude(sc) ed:SetRadius(sc * 100)
+        local ed = EffectData()
+        ed:SetOrigin(origin) ed:SetScale(sc) ed:SetMagnitude(sc) ed:SetRadius(sc * 100)
         util.Effect("500lb_air", ed, true, true)
     end
-    local ed1 = EffectData() ed1:SetOrigin(safePos)
-    ed1:SetScale(6) ed1:SetMagnitude(6) ed1:SetRadius(600)
+    local ed1 = EffectData()
+    ed1:SetOrigin(safePos) ed1:SetScale(6) ed1:SetMagnitude(6) ed1:SetRadius(600)
     util.Effect("HelicopterMegaBomb", ed1, true, true)
     boom(safePos, 5)
     boom(safePos + Vector(0,0,80),  4)
@@ -437,7 +365,6 @@ function ENT:CrashExplode()
     util.BlastDamage(self, self, safePos, 400, 200)
 
     SpawnGibs(safePos)
-
     self:Remove()
 end
 
@@ -449,9 +376,6 @@ function ENT:DestroyPlane()
     timer.Simple(12, function() if IsValid(self) then self:CrashExplode() end end)
 end
 
--- ============================================================
--- THINK
--- ============================================================
 function ENT:Think()
     if not self.DieTime or not self.SpawnTime then
         self:NextThink(CurTime() + 0.1)
@@ -473,8 +397,6 @@ function ENT:Think()
     if ct >= self.NextAlertTime then
         local plys = player.GetAll()
         for _, ent in ipairs(ents.GetAll()) do
-            -- ents.FindByClass("npc_*") does not support wildcards in GMod;
-            -- iterate all and check IsNPC() + capability guard.
             if not IsValid(ent) then continue end
             if not ent:IsNPC() then continue end
             if not ent.UpdateEnemyMemory then continue end
@@ -499,9 +421,6 @@ function ENT:Think()
     return true
 end
 
--- ============================================================
--- PHYSICS UPDATE
--- ============================================================
 function ENT:PhysicsUpdate(phys)
     if not self.DieTime or not self.sky then return end
 
@@ -630,17 +549,11 @@ function ENT:PhysicsUpdate(phys)
     self:SetAngles(self.ang)
 end
 
--- ============================================================
--- CLEANUP
--- ============================================================
 function ENT:OnRemove()
     self:StopAllSounds()
     hook.Remove("OnEntityCreated", "an71_relationship_hook_" .. self:EntIndex())
 end
 
--- ============================================================
--- GROUND FINDER
--- ============================================================
 function ENT:FindGround(centerPos)
     local startPos   = Vector(centerPos.x, centerPos.y, centerPos.z + 64)
     local endPos     = Vector(centerPos.x, centerPos.y, -16384)
