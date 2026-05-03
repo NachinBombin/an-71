@@ -293,21 +293,14 @@ end
 
 -- ============================================================
 -- SAFE CRASH ORIGIN
--- The plane may be partially or fully OOB when it crashes.
--- Walk from the current position toward CenterPos in 200 HU steps
--- until we find a point that is inside the world.
--- Falls back to CenterPos (at crash Z) if nothing works.
 -- ============================================================
 local function FindSafeCrashOrigin(rawPos, centerPos)
-    -- Already fine
     if util.IsInWorld(rawPos) then return rawPos end
 
-    -- Step toward the map center horizontally, keep the crash Z
     local target = Vector(centerPos.x, centerPos.y, rawPos.z)
     local dir    = target - rawPos
     local dist   = dir:Length()
     if dist < 1 then
-        -- rawPos == center; just raise Z and try
         local raised = Vector(centerPos.x, centerPos.y, rawPos.z)
         if util.IsInWorld(raised) then return raised end
         return centerPos
@@ -322,7 +315,6 @@ local function FindSafeCrashOrigin(rawPos, centerPos)
         end
     end
 
-    -- Last resort: map center at crash Z, then bare centerPos
     local atCenter = Vector(centerPos.x, centerPos.y, rawPos.z)
     if util.IsInWorld(atCenter) then return atCenter end
     return centerPos
@@ -340,8 +332,11 @@ local GIB_MODELS = {
     { mdl = "models/xqm/jetenginehuge.mdl",           count = 2 },
 }
 
-local GIB_DESPAWN_TIME = 40
-local GIB_MASS         = 2000
+local GIB_DESPAWN_TIME          = 40
+local GIB_MASS                  = 2000
+local GIB_NO_COLLIDE_TIME       = 1.0
+local GIB_COLLISION_GROUP_START = COLLISION_GROUP_DEBRIS_TRIGGER
+local GIB_COLLISION_GROUP_END   = COLLISION_GROUP_DEBRIS
 
 local function SpawnGibs(safeOrigin)
     for _, entry in ipairs(GIB_MODELS) do
@@ -349,7 +344,6 @@ local function SpawnGibs(safeOrigin)
             local gib = ents.Create("prop_physics")
             if not IsValid(gib) then continue end
 
-            -- Scatter around the safe origin; validate each piece individually
             local scatter = Vector(
                 math.Rand(-200, 200),
                 math.Rand(-200, 200),
@@ -369,14 +363,17 @@ local function SpawnGibs(safeOrigin)
             gib:SetModel(entry.mdl)
             gib:SetPos(spawnPos)
             gib:SetAngles(spawnAng)
+            gib:SetCollisionGroup(GIB_COLLISION_GROUP_START)
             gib:Spawn()
             gib:Activate()
+            gib:SetCollisionGroup(GIB_COLLISION_GROUP_START)
 
             local phys = gib:GetPhysicsObject()
             if IsValid(phys) then
                 phys:SetDragCoefficient(0)
                 phys:SetAngleDragCoefficient(0)
                 phys:SetMass(GIB_MASS)
+                phys:EnableCollisions(false)
                 phys:EnableGravity(true)
                 phys:Wake()
                 phys:ApplyForceCenter(Vector(
@@ -398,6 +395,16 @@ local function SpawnGibs(safeOrigin)
                 end
             end)
 
+            timer.Simple(GIB_NO_COLLIDE_TIME, function()
+                if not IsValid(gibRef) then return end
+                gibRef:SetCollisionGroup(GIB_COLLISION_GROUP_END)
+                local gibPhys = gibRef:GetPhysicsObject()
+                if IsValid(gibPhys) then
+                    gibPhys:EnableCollisions(true)
+                    gibPhys:Wake()
+                end
+            end)
+
             timer.Simple(GIB_DESPAWN_TIME, function()
                 if IsValid(gibRef) then
                     gibRef:Remove()
@@ -412,10 +419,6 @@ function ENT:CrashExplode()
     self.TumbleCrashed = true
     local pos = self:GetPos()
     local ang = self:GetAngles()
-
-    -- Resolve a safe origin for effects and gibs before anything else.
-    -- If the plane crossed the world boundary during tumble the raw pos
-    -- will be OOB; walk back toward CenterPos until we're inside.
     local safePos = FindSafeCrashOrigin(pos, self.CenterPos)
 
     local function boom(origin, sc)
