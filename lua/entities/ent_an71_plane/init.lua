@@ -295,6 +295,7 @@ end
 -- GIB SPAWNER
 -- Spawns burning debris pieces at the crash site.
 -- Each gib: zero drag, 2000 mass, gravity on -> falls fast like metal.
+-- Spawn position is validated in-world with two fallback levels.
 -- Ignited guaranteed via timer.Simple(0) after full entity init.
 -- Auto-removed after 40s.
 -- ============================================================
@@ -308,7 +309,39 @@ local GIB_MODELS = {
 }
 
 local GIB_DESPAWN_TIME = 40
-local GIB_MASS         = 2000   -- kg equivalent; heavy metal -> fast fall
+local GIB_MASS         = 2000
+
+-- Returns a safe spawn position guaranteed to be inside the world.
+-- Tries the scattered position first, then falls back to crashPos (+50z).
+-- Also traces DOWN from the candidate to confirm there is solid world
+-- geometry below (i.e. not floating above the skybox void).
+local function SafeGibPos(crashPos, scatter)
+    local candidate = crashPos + scatter
+
+    -- Primary check: Source engine world extents
+    if not util.IsInWorld(candidate) then
+        candidate = Vector(crashPos.x, crashPos.y, crashPos.z + 50)
+    end
+
+    -- Secondary check: make sure there is world below us within 32k HU.
+    -- If there is nothing below, we are above the void / past the skybox.
+    -- In that case snap to crashPos so the gibs land at the impact point.
+    local tr = util.TraceLine({
+        start  = candidate,
+        endpos  = candidate + Vector(0, 0, -32768),
+        mask   = MASK_SOLID_BRUSHONLY,
+    })
+    if not tr.Hit then
+        candidate = Vector(crashPos.x, crashPos.y, crashPos.z + 50)
+    end
+
+    -- Final fallback: if still OOB for any reason, clamp to crashPos
+    if not util.IsInWorld(candidate) then
+        candidate = crashPos
+    end
+
+    return candidate
+end
 
 local function SpawnGibs(crashPos, crashAng)
     for _, entry in ipairs(GIB_MODELS) do
@@ -321,7 +354,7 @@ local function SpawnGibs(crashPos, crashAng)
                 math.Rand(-200, 200),
                 math.Rand(  30, 120)
             )
-            local spawnPos = crashPos + scatter
+            local spawnPos = SafeGibPos(crashPos, scatter)
             local spawnAng = Angle(
                 math.Rand(0, 360),
                 math.Rand(0, 360),
@@ -336,14 +369,11 @@ local function SpawnGibs(crashPos, crashAng)
 
             local phys = gib:GetPhysicsObject()
             if IsValid(phys) then
-                -- Kill all drag so Source's air resistance doesn't float them
                 phys:SetDragCoefficient(0)
                 phys:SetAngleDragCoefficient(0)
-                -- Heavy mass -> gravity dominates, pieces fall fast
                 phys:SetMass(GIB_MASS)
                 phys:EnableGravity(true)
                 phys:Wake()
-                -- Outward explosive impulse (already mass-scaled by * GIB_MASS)
                 phys:ApplyForceCenter(Vector(
                     math.Rand(-600, 600),
                     math.Rand(-600, 600),
@@ -356,8 +386,6 @@ local function SpawnGibs(crashPos, crashAng)
                 ))
             end
 
-            -- Defer ignition by one tick so the entity is fully settled;
-            -- this guarantees every piece is on fire, no exceptions.
             local gibRef = gib
             timer.Simple(0, function()
                 if IsValid(gibRef) then
